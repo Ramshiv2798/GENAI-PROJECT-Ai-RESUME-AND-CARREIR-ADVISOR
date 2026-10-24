@@ -2,36 +2,33 @@ import os
 import json
 import re
 import time
+import tempfile
 from pathlib import Path
-
-import gradio as gr
+import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-
 # ============================================================
 # 1. Configuration
 # ============================================================
+st.set_page_config(page_title="AI Resume Screener and Career Advisor", layout="wide")
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-oss-120b")
 
 if not GROQ_API_KEY:
-    raise RuntimeError(
+    st.error(
         "GROQ_API_KEY is missing. Create a .env file containing "
         "GROQ_API_KEY=your_key (get one free at https://console.groq.com)."
     )
+    st.stop()
 
 client = Groq(api_key=GROQ_API_KEY)
-
-MAX_CONTEXT_CHARS = 12000  # keeps prompts well inside the model's context window
-
-
+MAX_CONTEXT_CHARS = 12000
 # ============================================================
-# 2. Prompts: role-based + few-shot + structured JSON
+# 2. Prompts
 # ============================================================
 ANALYSIS_SYSTEM_PROMPT = """
 Act as a senior technical recruiter with 15 years of experience screening
@@ -60,7 +57,6 @@ Rules:
 - Output JSON only. No markdown, no commentary.
 """.strip()
 
-# Few-shot example: teaches the model the exact output format and scoring style.
 FEW_SHOT_USER = """
 RESUME:
 Priya Nair. B.Tech CSE 2024. Skills: Python, SQL, Pandas, Excel.
@@ -102,28 +98,30 @@ questions using that information. Be specific and practical. If the question
 needs information that is not in the resume or job description, say so instead
 of guessing. Keep answers concise and student-friendly.
 """.strip()
-
-
 # ============================================================
 # 3. Reading and chunking documents
 # ============================================================
-def read_resume(file_path, pasted_text):
-    """Read resume text from an uploaded PDF/TXT file or pasted text."""
-    if file_path:
-        path = Path(file_path)
-        suffix = path.suffix.lower()
+def read_resume(uploaded_file, pasted_text):
+    """Read resume text from a Streamlit uploaded file or pasted text."""
+    if uploaded_file is not None:
+        suffix = Path(uploaded_file.name).suffix.lower()
 
         if suffix == ".pdf":
-            pages = PyPDFLoader(str(path)).load()
-            text = "\n".join(page.page_content for page in pages)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded_file.getbuffer())
+                tmp_path = tmp.name
+            try:
+                pages = PyPDFLoader(tmp_path).load()
+                text = "\n".join(p.page_content for p in pages)
+            finally:
+                os.remove(tmp_path)
         elif suffix in (".txt", ".md"):
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
         else:
             raise ValueError("Unsupported file type. Upload a PDF or TXT file.")
 
         if text.strip():
             return text
-
         raise ValueError(
             "No text could be read from the file. It may be a scanned image PDF. "
             "Try pasting the resume text instead."
@@ -136,10 +134,7 @@ def read_resume(file_path, pasted_text):
 
 
 def chunk_and_limit(text, max_chars=MAX_CONTEXT_CHARS):
-    """
-    Split long text into overlapping chunks, then keep chunks in order until
-    the size limit is reached. Prevents oversized prompts for long documents.
-    """
+    """Split long text into chunks and keep them in order until the size limit."""
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if len(text) <= max_chars:
         return text
@@ -152,13 +147,11 @@ def chunk_and_limit(text, max_chars=MAX_CONTEXT_CHARS):
         kept.append(chunk)
         total += len(chunk)
     return "\n".join(kept)
-
-
 # ============================================================
 # 4. Groq API call with error handling and retries
 # ============================================================
 def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attempts=3):
-    """Call Groq, retrying temporary failures. Raises RuntimeError with a clear message."""
+    """Call Groq, retrying temporary failures."""
     last_error = None
 
     for attempt in range(1, attempts + 1):
@@ -172,19 +165,14 @@ def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attem
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
 
-            # Qwen3 normally "thinks" before answering. Turn that off so the
-            # reply is clean JSON/text and faster.
             if MODEL_NAME.startswith("qwen/qwen3"):
                 kwargs["extra_body"] = {"reasoning_effort": "none"}
-            # GPT-OSS models always reason; "low" keeps answers fast and leaves
-            # enough tokens for the visible reply.
             elif MODEL_NAME.startswith("openai/gpt-oss"):
                 kwargs["extra_body"] = {"reasoning_effort": "low"}
 
             response = client.chat.completions.create(**kwargs)
             content = response.choices[0].message.content
 
-            # Safety net: remove any <think>...</think> block Qwen may emit.
             content = re.sub(r"<think>.*?</think>", "", content or "", flags=re.DOTALL).strip()
 
             if not content:
@@ -196,17 +184,16 @@ def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attem
             name = type(error).__name__
             message = str(error)
 
-            # Do not retry errors that retrying cannot fix.
             if name == "AuthenticationError" or "invalid_api_key" in message:
                 raise RuntimeError("Invalid GROQ_API_KEY. Check your .env file.") from error
             if name == "BadRequestError" and json_mode:
-                json_mode = False  # model may not support JSON mode; parser still extracts JSON
+                json_mode = False
                 continue
             if name == "BadRequestError":
                 raise RuntimeError(f"The request was rejected by Groq: {message}") from error
 
             if attempt < attempts:
-                time.sleep(2 * attempt)  # simple backoff (also helps with rate limits)
+                time.sleep(2 * attempt)
 
     raise RuntimeError(
         f"The Groq service is unavailable or rate limited. Please try again.\n"
@@ -249,8 +236,6 @@ def parse_analysis(raw):
         "score_reasoning": str(data.get("score_reasoning", "")).strip(),
         "suggestions": suggestions,
     }
-
-
 # ============================================================
 # 5. Core feature: analyze resume vs job description
 # ============================================================
@@ -281,143 +266,135 @@ def format_report(result):
 ### 3 Suggestions to Improve Your Resume
 {suggestions}
 """
+def analyze_resume(uploaded_file, pasted_text, job_description):
+    if not job_description or not job_description.strip():
+        raise ValueError("Please enter the job description.")
 
+    resume_text = chunk_and_limit(read_resume(uploaded_file, pasted_text))
+    jd_text = chunk_and_limit(job_description, max_chars=6000)
+    user_prompt = f"RESUME:\n{resume_text}\n\nJOB DESCRIPTION:\n{jd_text}"
 
-def analyze_resume(file_path, pasted_text, job_description, state):
-    """Returns: state, report markdown, JSON dict, reset chat history."""
-    try:
-        if not job_description or not job_description.strip():
-            raise ValueError("Please enter the job description.")
+    messages = [
+        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user", "content": FEW_SHOT_USER},
+        {"role": "assistant", "content": FEW_SHOT_ASSISTANT},
+        {"role": "user", "content": user_prompt},
+    ]
 
-        resume_text = chunk_and_limit(read_resume(file_path, pasted_text))
-        jd_text = chunk_and_limit(job_description, max_chars=6000)
-
-        user_prompt = f"RESUME:\n{resume_text}\n\nJOB DESCRIPTION:\n{jd_text}"
-
-        messages = [
-            {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
-            {"role": "user", "content": FEW_SHOT_USER},
-            {"role": "assistant", "content": FEW_SHOT_ASSISTANT},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        result = None
-        for _ in range(2):  # one retry if the JSON is malformed
-            raw = call_groq(messages, json_mode=True)
-            try:
-                result = parse_analysis(raw)
-                break
-            except (ValueError, json.JSONDecodeError):
-                continue
-
-        if result is None:
-            raise RuntimeError("The model returned invalid JSON twice. Please try again.")
-
-        new_state = {"resume": resume_text, "jd": jd_text, "analysis": result}
-        return new_state, format_report(result), result, []
-
-    except Exception as error:
-        return state, f"**Error:** {error}", None, []
-
-
-# ============================================================
-# 6. Chat interface (career advisor)
-# ============================================================
-def chat(message, history, state):
-    message = (message or "").strip()
-    history = history or []
-
-    if not message:
-        return history, ""
-
-    if not state:
-        reply = "Please analyze a resume and job description first, then ask me questions."
-    else:
-        context = (
-            f"RESUME:\n{state['resume']}\n\n"
-            f"JOB DESCRIPTION:\n{state['jd']}\n\n"
-            f"FIT ANALYSIS (JSON):\n{json.dumps(state['analysis'], indent=2)}"
-        )
-        messages = [
-            {"role": "system", "content": CHAT_SYSTEM_PROMPT + "\n\n" + context}
-        ]
-        messages += [{"role": m["role"], "content": m["content"]} for m in history[-10:]]
-        messages.append({"role": "user", "content": message})
-
+    result = None
+    for _ in range(2):
+        raw = call_groq(messages, json_mode=True)
         try:
-            reply = call_groq(messages, max_tokens=1500, temperature=0.4)
+            result = parse_analysis(raw)
+            break
+        except (ValueError, json.JSONDecodeError):
+            continue
+
+    if result is None:
+        raise RuntimeError("The model returned invalid JSON twice. Please try again.")
+
+    state = {"resume": resume_text, "jd": jd_text, "analysis": result}
+    return state, format_report(result), result
+# ============================================================
+# 6. Chat (career advisor)
+# ============================================================
+def chat_reply(message, history, state):
+    context = (
+        f"RESUME:\n{state['resume']}\n\n"
+        f"JOB DESCRIPTION:\n{state['jd']}\n\n"
+        f"FIT ANALYSIS (JSON):\n{json.dumps(state['analysis'], indent=2)}"
+    )
+    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT + "\n\n" + context}]
+    messages += [{"role": m["role"], "content": m["content"]} for m in history[-10:]]
+    messages.append({"role": "user", "content": message})
+    return call_groq(messages, max_tokens=1500, temperature=0.4)
+# ============================================================
+# 7. Streamlit interface
+# ============================================================
+st.session_state.setdefault("state", None)
+st.session_state.setdefault("report", None)
+st.session_state.setdefault("result_json", None)
+st.session_state.setdefault("history", [])
+st.session_state.setdefault("uploader_key", 0)
+
+st.title("AI Resume Screener and Career Advisor")
+st.caption(
+    "Upload a resume, paste a job description, and get a fit score, "
+    "missing skills, and three improvement suggestions."
+)
+
+left, right = st.columns(2)
+
+with left:
+    uploaded = st.file_uploader(
+        "Upload resume (PDF or TXT)",
+        type=["pdf", "txt"],
+        key=f"uploader_{st.session_state.uploader_key}",
+    )
+    pasted = st.text_area(
+        "...or paste resume text",
+        height=150,
+        key=f"pasted_{st.session_state.uploader_key}",
+        placeholder="Paste your resume here if you are not uploading a file.",
+    )
+    jd = st.text_area(
+        "Job description",
+        height=250,
+        key=f"jd_{st.session_state.uploader_key}",
+        placeholder="Paste the full job description here.",
+    )
+
+    c1, c2 = st.columns(2)
+    analyze_clicked = c1.button("Analyze", type="primary", use_container_width=True)
+    clear_clicked = c2.button("Clear all", use_container_width=True)
+
+if clear_clicked:
+    for k in ("state", "report", "result_json"):
+        st.session_state[k] = None
+    st.session_state.history = []
+    st.session_state.uploader_key += 1
+    st.rerun()
+
+if analyze_clicked:
+    try:
+        with st.spinner("Analyzing resume..."):
+            state, report, result = analyze_resume(uploaded, pasted, jd)
+        st.session_state.state = state
+        st.session_state.report = report
+        st.session_state.result_json = result
+        st.session_state.history = []
+    except Exception as error:
+        st.session_state.report = None
+        left.error(str(error))
+
+with right:
+    if st.session_state.report:
+        st.markdown(st.session_state.report)
+        with st.expander("Raw JSON output"):
+            st.json(st.session_state.result_json)
+    else:
+        st.info("Upload a resume and job description, then click Analyze.")
+
+st.divider()
+st.subheader("Career Advisor Chat")
+
+for m in st.session_state.history:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+if prompt := st.chat_input("Example: How should I rewrite my project section for this role?"):
+    if not st.session_state.state:
+        st.warning("Please analyze a resume and job description first.")
+    else:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        try:
+            with st.spinner("Thinking..."):
+                reply = chat_reply(prompt, st.session_state.history, st.session_state.state)
         except Exception as error:
             reply = f"Sorry, I could not answer that. {error}"
-
-    history = history + [
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": reply},
-    ]
-    return history, ""
-
-
-def clear_all():
-    return None, None, "", None, "Upload a resume and job description, then click Analyze.", None, [], ""
-
-
-# ============================================================
-# 7. Gradio interface
-# ============================================================
-with gr.Blocks(title="AI Resume Screener and Career Advisor") as demo:
-    session_state = gr.State(value=None)
-
-    gr.Markdown(
-        """
-        # AI Resume Screener and Career Advisor
-        Upload a resume, paste a job description, and get a fit score,
-        missing skills, and three improvement suggestions.
-        """
-    )
-
-    with gr.Row():
-        with gr.Column(scale=1):
-            resume_file = gr.File(
-                label="Upload resume (PDF or TXT)",
-                file_types=[".pdf", ".txt"],
-                type="filepath",
-            )
-            resume_text = gr.Textbox(
-                label="...or paste resume text",
-                lines=6,
-                placeholder="Paste your resume here if you are not uploading a file.",
-            )
-            job_desc = gr.Textbox(
-                label="Job description",
-                lines=10,
-                placeholder="Paste the full job description here.",
-            )
-            analyze_button = gr.Button("Analyze", variant="primary")
-            clear_button = gr.Button("Clear all")
-
-        with gr.Column(scale=1):
-            report = gr.Markdown("Upload a resume and job description, then click Analyze.")
-            with gr.Accordion("Raw JSON output", open=False):
-                json_output = gr.JSON()
-
-    gr.Markdown("## Career Advisor Chat")
-    chatbot = gr.Chatbot(type="messages", height=380, label="Ask follow-up questions")
-    chat_box = gr.Textbox(
-        label="Ask a question",
-        placeholder="Example: How should I rewrite my project section for this role?",
-    )
-    ask_button = gr.Button("Ask")
-
-    analyze_button.click(
-        fn=analyze_resume,
-        inputs=[resume_file, resume_text, job_desc, session_state],
-        outputs=[session_state, report, json_output, chatbot],
-    )
-    ask_button.click(chat, [chat_box, chatbot, session_state], [chatbot, chat_box])
-    chat_box.submit(chat, [chat_box, chatbot, session_state], [chatbot, chat_box])
-    clear_button.click(
-        clear_all,
-        outputs=[resume_file, resume_text, job_desc, session_state, report, json_output, chatbot, chat_box],
-    )
-
-if __name__ == "__main__":
-    demo.queue().launch()
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        st.session_state.history += [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": reply},
+        ]
