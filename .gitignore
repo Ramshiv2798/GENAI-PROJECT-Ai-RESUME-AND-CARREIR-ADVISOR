@@ -1,0 +1,13 @@
+# Secrets - NEVER commit
+.env
+.env.*
+!.env.example
+
+# Virtual environments and caches
+Ai/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env 
