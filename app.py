@@ -1,102 +1,135 @@
-"""Gradio UI for the AI Resume Screener and Career Advisor. Logic lives in core.py."""
-import gradio as gr
-
+import os
+import tempfile
+import streamlit as st
 import core
+DEFAULT_REPORT = "Upload a resume and job description, then click Analyze."
+
+st.set_page_config(page_title="AI Resume Screener and Career Advisor", layout="wide")
 
 
-def analyze(file_path, pasted_text, job_description):
-    # Any failure returns state=None and an empty chat, so the advisor can never
-    # answer using a previous candidate's data.
-    state, report, result = core.safe_analyze(file_path, pasted_text, job_description)
-    return state, report, result, []
+# ---------- session state ----------
+def init_state():
+    defaults = {
+        "state": None,            # analysis state passed to the advisor
+        "report": DEFAULT_REPORT,
+        "result": None,           # raw JSON output
+        "messages": [],           # chat history: [{"role": ..., "content": ...}]
+        "uploader_key": 0,        # bump to reset the file uploader
+        "resume_text": "",
+        "job_desc": "",
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
 
-def chat(message, history, state):
-    message = (message or "").strip()
-    history = history or []
-
-    if not message:
-        yield history, ""
-        return
-
-    history = history + [
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": ""},
-    ]
-
-    if not state:
-        history[-1]["content"] = "Please analyze a resume and job description first."
-        yield history, ""
-        return
-
-    yield history, ""  # clear the input box immediately
-    try:
-        for partial in core.chat_stream(message, history[:-2], state):
-            history[-1]["content"] = partial
-            yield history, ""
-    except Exception as error:
-        history[-1]["content"] = f"Sorry, I could not answer that. {error}"
-        yield history, ""
+init_state()
 
 
+# ---------- callbacks ----------
 def clear_all():
-    return None, None, "", None, "Upload a resume and job description, then click Analyze.", None, [], ""
+    st.session_state.state = None
+    st.session_state.report = DEFAULT_REPORT
+    st.session_state.result = None
+    st.session_state.messages = []
+    st.session_state.resume_text = ""
+    st.session_state.job_desc = ""
+    st.session_state.uploader_key += 1  # new key -> empty uploader
 
 
-with gr.Blocks(title="AI Resume Screener and Career Advisor") as demo:
-    session_state = gr.State(value=None)
+def analyze(uploaded_file, pasted_text, job_description):
+    # Any failure leaves state=None and an empty chat, so the advisor can never
+    # answer using a previous candidate's data.
+    tmp_path = None
+    try:
+        if uploaded_file is not None:
+            suffix = os.path.splitext(uploaded_file.name)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(uploaded_file.getbuffer())
+                tmp_path = tmp.name
 
-    gr.Markdown(
-        """
-        # AI Resume Screener and Career Advisor
-        Upload a resume, paste a job description, and get an evidence-based fit score,
-        missing skills, and three improvement suggestions.
-        """
+        state, report, result = core.safe_analyze(tmp_path, pasted_text, job_description)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    st.session_state.state = state
+    st.session_state.report = report
+    st.session_state.result = result
+    st.session_state.messages = []
+
+
+# ---------- layout ----------
+st.title("AI Resume Screener and Career Advisor")
+st.markdown(
+    "Upload a resume, paste a job description, and get an evidence-based fit score, "
+    "missing skills, and three improvement suggestions."
+)
+
+left, right = st.columns(2)
+
+with left:
+    resume_file = st.file_uploader(
+        "Upload resume (PDF or TXT)",
+        type=["pdf", "txt"],
+        key=f"resume_file_{st.session_state.uploader_key}",
+    )
+    st.text_area(
+        "...or paste resume text",
+        height=150,
+        key="resume_text",
+        placeholder="Paste your resume here if you are not uploading a file.",
+    )
+    st.text_area(
+        "Job description",
+        height=250,
+        key="job_desc",
+        placeholder="Paste the full job description here.",
     )
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            resume_file = gr.File(
-                label="Upload resume (PDF or TXT)",
-                file_types=[".pdf", ".txt"],
-                type="filepath",
-            )
-            resume_text = gr.Textbox(
-                label="...or paste resume text", lines=6,
-                placeholder="Paste your resume here if you are not uploading a file.",
-            )
-            job_desc = gr.Textbox(
-                label="Job description", lines=10,
-                placeholder="Paste the full job description here.",
-            )
-            analyze_button = gr.Button("Analyze", variant="primary")
-            clear_button = gr.Button("Clear all")
+    analyze_clicked = st.button("Analyze", type="primary")
+    st.button("Clear all", on_click=clear_all)
 
-        with gr.Column(scale=1):
-            report = gr.Markdown("Upload a resume and job description, then click Analyze.")
-            with gr.Accordion("Raw JSON output", open=False):
-                json_output = gr.JSON()
+if analyze_clicked:
+    with st.spinner("Analyzing..."):
+        analyze(resume_file, st.session_state.resume_text, st.session_state.job_desc)
 
-    gr.Markdown("## Career Advisor Chat")
-    chatbot = gr.Chatbot(type="messages", height=380, label="Ask follow-up questions")
-    chat_box = gr.Textbox(
-        label="Ask a question",
-        placeholder="Example: How should I rewrite my project section for this role?",
-    )
-    ask_button = gr.Button("Ask")
+with right:
+    st.markdown(st.session_state.report)
+    with st.expander("Raw JSON output"):
+        if st.session_state.result is not None:
+            st.json(st.session_state.result)
 
-    analyze_button.click(
-        analyze,
-        inputs=[resume_file, resume_text, job_desc],
-        outputs=[session_state, report, json_output, chatbot],
-    )
-    ask_button.click(chat, [chat_box, chatbot, session_state], [chatbot, chat_box])
-    chat_box.submit(chat, [chat_box, chatbot, session_state], [chatbot, chat_box])
-    clear_button.click(
-        clear_all,
-        outputs=[resume_file, resume_text, job_desc, session_state, report, json_output, chatbot, chat_box],
-    )
+# ---------- career advisor chat ----------
+st.markdown("## Career Advisor Chat")
 
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-if __name__ == "__main__":
-    demo.queue().launch()
+prompt = st.chat_input("Ask a follow-up question, e.g. How should I rewrite my project section?")
+
+if prompt and prompt.strip():
+    message = prompt.strip()
+    history = list(st.session_state.messages)  # history before this turn
+
+    st.session_state.messages.append({"role": "user", "content": message})
+    with st.chat_message("user"):
+        st.markdown(message)
+
+    with st.chat_message("assistant"):
+        if not st.session_state.state:
+            answer = "Please analyze a resume and job description first."
+            st.markdown(answer)
+        else:
+            placeholder = st.empty()
+            answer = ""
+            try:
+                # core.chat_stream yields the cumulative partial answer
+                for partial in core.chat_stream(message, history, st.session_state.state):
+                    answer = partial
+                    placeholder.markdown(answer)
+            except Exception as error:
+                answer = f"Sorry, I could not answer that. {error}"
+                placeholder.markdown(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
