@@ -1,7 +1,3 @@
-"""Automated tests. The Groq API is mocked, so no key or network is needed.
-
-Run:  pytest -v
-"""
 import json
 import math
 import os
