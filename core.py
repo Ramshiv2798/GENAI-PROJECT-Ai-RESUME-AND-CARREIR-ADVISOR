@@ -1,7 +1,3 @@
-"""Core logic for the AI Resume Screener and Career Advisor (no UI code).
-
-Keeping this separate from app.py lets the logic be unit-tested without Gradio.
-"""
 import json
 import math
 import os
