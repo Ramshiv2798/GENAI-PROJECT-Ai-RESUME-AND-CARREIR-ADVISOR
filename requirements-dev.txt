@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest
+
+# Only needed to regenerate samples/*.pdf (not needed to run the tests):
+# reportlab
+# pillow

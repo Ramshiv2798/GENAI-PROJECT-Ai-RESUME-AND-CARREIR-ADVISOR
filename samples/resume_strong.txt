@@ -1,0 +1,22 @@
+Anita Rao
+anita.rao@example.com | Hyderabad, India (synthetic sample resume)
+
+SUMMARY
+Entry-level data analyst with hands-on experience in dashboards and experiments.
+
+SKILLS
+Python, SQL, Tableau, Excel, Pandas, Statistics
+
+EXPERIENCE
+Data Analyst Intern, Brightline Retail (6 months)
+- Built weekly Tableau dashboards for the sales team covering revenue and churn.
+- Wrote SQL queries to pull order data and cleaned it with Python and Pandas.
+- Presented monthly findings to the marketing manager and sales leads.
+
+PROJECTS
+Email Campaign A/B Test
+- Ran an A/B test on an email campaign and analysed results with Python and statistics.
+- Used a t-test to compare open rates between the two variants.
+
+EDUCATION
+B.Tech Computer Science and Engineering, 2024

@@ -1,0 +1,11 @@
+Junior DevOps Engineer
+
+You will help run our cloud platform and release pipeline.
+
+Required:
+- Docker and Kubernetes
+- Terraform
+- AWS
+- CI/CD pipelines
+- Linux
+- Python scripting

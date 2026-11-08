@@ -1,0 +1,14 @@
+Data Analyst (Entry Level)
+
+We are looking for a Data Analyst to join our growth team. You will build weekly
+dashboards, run experiments and present findings to business stakeholders.
+
+Required:
+- Python for data analysis
+- SQL for querying relational databases
+- Tableau for dashboards and reporting
+- Statistics fundamentals
+- A/B testing
+- Stakeholder communication
+
+0-2 years of experience. Bachelor's degree in a quantitative field.
