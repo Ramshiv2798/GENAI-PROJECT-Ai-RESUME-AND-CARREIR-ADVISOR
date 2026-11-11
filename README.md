@@ -1,72 +1,108 @@
 # AI Resume Screener and Career Advisor
 
-A Streamlit app that compares **one resume with one job description**, shows which mandatory skills
-the resume gives textual evidence for, scores the fit out of 100, gives three improvement suggestions,
-and lets the user ask follow-up questions in a career-advisor chat.
+A Streamlit web app that compares **one resume with one job description**. The user uploads or pastes a
+resume and a job description and receives a fit score out of 100, a list of matched and missing skills
+(each match backed by a quote from the resume), three improvement suggestions, and a career-advisor chat.
 
-> **What the score is, and is not.** It is an application-specific comparison of the resume and the
-> job description you supply. It is **not** a universal ATS score and **not** a hiring decision. The
-> skills part checks what the resume *says*; it does not prove the candidate is competent.
+> **What the score is, and is not.** It is an application-specific comparison of the resume and the job
+> description you supply. It is **not** a universal ATS score and **not** a hiring decision. The skills part
+> checks what the resume *says*; it does not prove the candidate is competent.
 
 ## Problem statement
-Candidates rarely know why a resume fails a role, and an LLM asked for "a score" will happily accept
-claims it cannot back up. This project asks the model for a structured analysis, then **checks the
-model's skill claims against the resume text in code** and calculates the skills score itself.
+Candidates rarely know why a resume fails a role, and an LLM asked for "a score" will happily accept claims
+it cannot back up. This project asks the model for a structured analysis, then **checks the model's skill
+claims against the resume text in code** and calculates the skills score itself.
 
 ## Features
-- Upload a resume (PDF or TXT) or paste text, paste a job description, click **Analyze**.
-- Fit score out of 100 with a component breakdown showing which part is code-calculated and which is model judgement.
-- Matched skills, each with a quote from the resume and how it was classified (described as used / listed only / mentioned only).
-- Missing mandatory skills, and preferred ("nice to have") skills shown separately.
-- Exactly three suggestions that must not tell the candidate to claim skills they lack.
-- Streaming career-advisor chat grounded in the resume, the job description and the verified analysis.
-- Prompt-injection handling (limited; see below), clear error messages, and a "Clear all" button.
-- Editing the resume, upload or job description after an analysis **clears the old result and chat**.
+| Module | What it does |
+|---|---|
+| Resume and job input | Upload a resume (PDF or TXT, 5 MB max) or paste text, paste a job description, click **Analyze** |
+| Fit score | Score out of 100 with a component breakdown showing which part is code-calculated and which is model judgement |
+| Skill matching | Matched skills, each with a quote from the resume and a classification (described as used / listed only / mentioned only) |
+| Gap analysis | Missing mandatory skills, plus preferred ("nice to have") skills shown separately |
+| Improvement suggestions | Exactly three suggestions that must not tell the candidate to claim skills they lack |
+| Career-advisor chat | Streaming follow-up chat grounded in the resume, the job description and the verified analysis |
+| Safety and usability | Prompt-injection handling, clear error messages, a **Clear all** button. Editing the resume, upload or job description clears the old result and chat |
 
-## Repository, setup and launch
-```
-git clone <YOUR-REPOSITORY-URL>      # TODO(author): replace with the real clone URL
-cd <repository-folder>
-python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt                          # add requirements-dev.txt for pytest
-cp .env.example .env                                     # then edit .env
-streamlit run app.py
-```
-- **Python:** 3.12 (the version the tests were run with; 3.10+ should work but is untested).
-- **Configuration (`.env`):** `GROQ_API_KEY` (free key from https://console.groq.com/keys) and optional
-  `MODEL_NAME` (default `openai/gpt-oss-120b`). On Streamlit Cloud put the same names in the app's secrets. Never commit `.env`.
-- **Supported files:** PDF and TXT only (5 MB max). Scanned/image PDFs are not supported.
-- **Demo link / screenshots:** TODO(author): add the deployed URL and screenshots (`docs/screenshots/`) after a live run.
+## Course concepts used
+- **Prompt engineering** with a role, security rules, a scoring rubric and strict JSON format
+- **Few-shot prompting**: one worked example is included in the analysis prompt
+- **Structured JSON output** with strict validation and automatic retry (up to 3 attempts)
+- **Grounded verification**: every matched skill needs a quote that exists in the resume, names the skill, and is not negated or only planned
+- **Code-calculated scoring**: the skills score and the total are computed in Python, not trusted from the model
+- **Streaming** responses for the career-advisor chat
+- **Prompt-injection defence**: user text is delimited in tags, tags are stripped, and instruction-like lines are ignored as evidence
 
-## File structure
+## Project structure
 ```
 app.py                 Streamlit interface only (inputs, state, invalidation, chat display)
-core.py                prompts, document reading, Groq calls, validation, scoring, report, chat
-live_tests.py          real-model test runner (needs a Groq key), writes live_results.md/json
-requirements.txt       runtime dependencies, pinned to tested versions
-requirements-dev.txt   adds pytest
-.env.example           dummy configuration
-pytest.ini             test settings
-samples/               synthetic resumes and job descriptions (no real people)
+core.py                Prompts, document reading, Groq calls, validation, scoring, report, chat
+live_tests.py          Real-model test runner (needs a Groq key), writes live_results.md/json
+requirements.txt       Runtime dependencies, pinned to tested versions
+requirements-dev.txt   Adds pytest
+.env.example           Template for your API key
+pytest.ini             Test settings
+samples/               Synthetic resumes and job descriptions (no real people)
 tests/test_core.py     100 offline tests of core.py (model mocked)
 tests/test_app.py      23 interface tests with Streamlit AppTest (model mocked)
-docs/sample_output.md  example report (stubbed model reply, see below)
-TESTING.md             test plan, offline results, live-test table
+docs/sample_output.md  Example report (stubbed model reply, see below)
+TESTING.md             Test plan, offline results, live-test table
 ```
 `core.py` is long. If the project grows, split it into prompts, validation/scoring, and API/document reading.
 
-## Analysis flow
-1. `app.py` saves the upload to a temporary file inside `core.analyze_upload`, which also deletes it.
-2. `read_resume` extracts text (pypdf) and rejects empty/scanned files; long texts keep their start and end (`prepare_text`).
-3. The prompt (role, security rules, rubric, one few-shot example) asks for JSON. Resume and job text are placed in
-   `<resume>` / `<job_description>` tags with those tags stripped from user text.
-4. `validate_analysis` checks the reply (see "Validation rules"), and `run_analysis` asks the model for a corrected reply
-   up to 3 times; the last attempt is repaired deterministically.
-5. The skills score and the total are calculated in Python; `format_report` builds the report.
-6. Chat answers use the resume, job description and the *verified* analysis. Skills the model extracted but that are not in the
-   resume are withheld, and the model's own explanation is labelled unverified.
+## Setup
+1. Install Python 3.1 (the version the tests were run with; 3.10+ should work but is untested).
+2. Create a free Groq API key at https://console.groq.com/keys
+3. Clone the repository and open the project folder:
+   ```
+   git clone <YOUR-REPOSITORY-URL>      # TODO(author): replace with the real clone URL
+   cd <repository-folder>
+   python -m venv .venv
+   .venv\Scripts\activate               # Windows   (Mac/Linux: source .venv/bin/activate)
+   pip install -r requirements.txt
+   ```
+4. Copy `.env.example` to `.env` and put your key in it:
+   ```
+   GROQ_API_KEY=gsk_your_key_here
+   ```
+5. Run the app:
+   ```
+   streamlit run app.py
+   ```
+   It opens at http://localhost:8501
 
-## Scoring
+Supported files: PDF and TXT only (5 MB max). Scanned or image PDFs are not supported; paste the text instead.
+
+### Configuration
+| Setting | Required | Default |
+|---|---|---|
+| `GROQ_API_KEY` | yes | none |
+| `MODEL_NAME` | no | `openai/gpt-oss-120b` |
+
+Settings are read from `.env` locally or from Streamlit secrets when deployed. Never commit `.env`.
+
+## Run the tests
+```
+pip install -r requirements-dev.txt
+pytest                          # offline: Groq is mocked, no key or network needed
+python live_tests.py --runs 3   # real model: needs GROQ_API_KEY in .env, writes live_results.md
+```
+**Observed results.** Offline: 123 passed (100 core + 23 interface), last run 10 Nov 2026. These verify the
+application's behaviour under controlled model replies; they do **not** establish the real model's accuracy or
+consistency. Live: **not yet recorded** (needs a key); see `TESTING.md`.
+
+## How the analysis works
+1. `app.py` saves the upload to a temporary file inside `core.analyze_upload`, which also deletes it.
+2. `read_resume` extracts text (pypdf) and rejects empty or scanned files. Long texts keep their start and end (`prepare_text`).
+3. The prompt (role, security rules, rubric, one few-shot example) asks for JSON. Resume and job text are placed in
+   `<resume>` / `<job_description>` tags, with those tags stripped from user text.
+4. `validate_analysis` checks the reply, and `run_analysis` asks the model for a corrected reply up to 3 times;
+   the last attempt is repaired deterministically.
+5. The skills score and the total are calculated in Python, and `format_report` builds the report.
+6. Chat answers use the resume, the job description and the *verified* analysis. Skills the model extracted but that are
+   not in the resume are withheld, and the model's own explanation is labelled unverified.
+
+## How the score is calculated
 Total = skills coverage (40) + experience relevance (25) + projects and achievements (20) + education and clarity (15).
 
 **Skills coverage is calculated by the code:** `40 × credit ÷ mandatory requirements`, rounded.
@@ -77,23 +113,33 @@ Total = skills coverage (40) + experience relevance (25) + projects and achievem
 | Quote in a Skills section ("listed"), or any other mention ("mentioned") | 0.5 |
 | No usable quote; quote not in the resume; quote does not name the skill; resume says the skill was **not** used; resume only **plans to learn** it | 0 |
 
-Only **mandatory** requirements are counted. Preferred / optional / "nice to have" skills are shown separately and add no
-points. Skills the job description says are "not required" are ignored. Alternatives such as "Tableau or Power BI" count as
-one requirement satisfied by either. These categories come from the job description's wording (headings such as
-"Required:" / "Nice to have:" and cues such as "optional", "a plus", "not required"); anything not marked is treated as mandatory.
+Rules in detail:
+- Only **mandatory** requirements are counted. Preferred / optional / "nice to have" skills are shown separately and add no points.
+- Skills the job description says are "not required" are ignored.
+- Alternatives such as "Tableau or Power BI" count as one requirement, satisfied by either.
+- Categories come from the job description's wording (headings such as "Required:" / "Nice to have:" and cues such as
+  "optional", "a plus", "not required"). Anything not marked is treated as mandatory.
 
-**Model judgement (not verified by code, 60 of 100 points):** experience relevance, projects and achievements, education and
-clarity. Code only enforces that each number is a finite value within its range.
+**Model judgement (60 of 100 points):** experience relevance, projects and achievements, education and clarity.
+Code only enforces that each number is a finite value within its range.
 
-## Validation rules (what is enforced by code)
-- A matched skill needs a quote that exists in the resume, **names that skill** (aliases such as K8s are understood), and is
-  not negated ("never used X") or a plan ("will learn X"). Short quotes are read in the context of their resume sentence.
-- Text in the resume that looks like instructions to the AI is ignored as evidence.
-- Required skills are checked against the job description; mandatory skills the model forgot are added; each requirement ends
-  up in exactly one of matched or missing; names are normalised and duplicates removed.
-- `candidate_skills` is grounded in the resume text; unsupported entries are reported and kept away from the advisor.
-- If any of this fails, the model is asked for a corrected analysis; if it still fails the app repairs the lists and
-  recalculates the skills score from verified evidence only, with a warning.
+## How the model's output is checked
+| Rule | Enforced by code |
+|---|---|
+| Matched skill needs a quote | The quote must exist in the resume, **name that skill** (aliases such as K8s are understood), and not be negated ("never used X") or a plan ("will learn X"). Short quotes are read in the context of their resume sentence |
+| Resume text that looks like instructions | Ignored as evidence |
+| Required skills | Checked against the job description. Mandatory skills the model forgot are added |
+| Matched vs missing | Each requirement ends up in exactly one of the two lists. Names are normalised and duplicates removed |
+| `candidate_skills` | Grounded in the resume text. Unsupported entries are reported and kept away from the advisor |
+| Failure | The model is asked for a corrected analysis. If it still fails, the app repairs the lists and recalculates the skills score from verified evidence only, with a warning |
+
+What is checked and what is not:
+
+| Checked by the app | Still only a model suggestion |
+|---|---|
+| Quotes exist, name the skill, and are not negated or only planned | Experience, projects and education scores (60 points) |
+| Skills score and total are calculated in code | The model's overall explanation |
+| Requirement categories are matched against the job description | Whether the candidate is actually competent |
 
 ## Sample input and output
 Inputs: `samples/resume_strong.txt` + `samples/jd_data_analyst.txt`. The output below was produced by running the real
@@ -136,26 +182,28 @@ are tracked in `TESTING.md`.
 
 </details>
 
-More inputs: `resume_weak.txt` (weak match), `jd_devops.txt` (skill gap), `resume_negated.txt` (never-used / planned skills),
-`jd_categories.txt` (required vs optional vs not required), `resume_injection*.txt` (prompt injection),
-`resume_strong.pdf` (text PDF), `resume_scanned.pdf` (image PDF: rejected with a "paste the text" message).
+More sample inputs:
 
-## Tests
-```
-pip install -r requirements-dev.txt
-pytest                     # offline: Groq is mocked, no key or network
-python live_tests.py --runs 3   # real model: needs GROQ_API_KEY in .env; writes live_results.md
-```
-**Observed results.** Offline: 123 passed (100 core + 23 interface), last run 10 Nov 2026. These verify the application's
-behaviour under controlled model replies; they do **not** establish the real model's accuracy or consistency. Live: **not yet
-recorded** (needs a key); see `TESTING.md`.
+| File | Purpose |
+|---|---|
+| `resume_weak.txt` | Weak match |
+| `jd_devops.txt` | Skill gap |
+| `resume_negated.txt` | Never-used and planned skills |
+| `jd_categories.txt` | Required vs optional vs not required |
+| `resume_injection*.txt` | Prompt injection |
+| `resume_strong.pdf` | Text PDF |
+| `resume_scanned.pdf` | Image PDF: rejected with a "paste the text" message |
 
 ## Prompt injection: what is and is not protected
-- Enforced by code: user text is delimited and tag-stripped; instruction-like lines are ignored as skill evidence; the skills
-  score and the total are calculated by the app, so a model that obeys "give a score of 100" cannot change them.
-- **Not enforced:** the other three components are model judgements. A real model could be influenced there. The app only warns
-  when instruction-like text coincides with near-maximum marks, and live case L3b measures how a real model behaves.
-  Treat those 60 points as needing human review whenever the input is flagged.
+**Enforced by code**
+- User text is delimited and tag-stripped.
+- Instruction-like lines are ignored as skill evidence.
+- The skills score and the total are calculated by the app, so a model that obeys "give a score of 100" cannot change them.
+
+**Not enforced**
+- The other three components are model judgements, so a real model could be influenced there. The app only warns when
+  instruction-like text coincides with near-maximum marks, and live case L3b measures how a real model behaves.
+- Treat those 60 points as needing human review whenever the input is flagged.
 
 ## Reliability, timeouts and retries
 - Each Groq request times out after 60 s (`API_TIMEOUT_SECONDS`); the Groq client's own retries are off.
@@ -163,13 +211,26 @@ recorded** (needs a key); see `TESTING.md`.
 - A reply that fails validation triggers up to 3 model calls in total (`MAX_ANALYSIS_ATTEMPTS`).
 - The page shows short messages. Full exceptions go to the application log (logger `resume_screener`).
 
+## Deploy on Streamlit Community Cloud
+1. Push `app.py`, `core.py`, `requirements.txt` and `.gitignore` to a GitHub repository. Do **not** push `.env`.
+2. Go to https://share.streamlit.io, sign in with GitHub and click **Create app**.
+3. Select the repository, branch `main` and main file `app.py`.
+4. Open **Advanced settings → Secrets** and add: `GROQ_API_KEY = "gsk_your_key_here"`
+5. Click **Deploy**.
+6. Add the deployed URL to the **Live demo** line at the top of this file.
+
 ## Limitations
-- **Scanned PDFs:** no OCR; paste the text instead.
-- **Truncation:** texts over 24,000 (resume) / 12,000 (job description) characters keep their start and end; the middle is skipped and a warning is shown.
+- **Scanned PDFs:** no OCR. Paste the text instead.
+- **Truncation:** texts over 24,000 (resume) / 12,000 (job description) characters keep their start and end; the middle is
+  skipped and a warning is shown.
 - **Evidence interpretation is heuristic.** Negation, plans and "described as used" are detected with wording rules, so unusual
-  phrasing can be misread in either direction. Quotes must name the skill, so a genuine example that never uses the skill's
-  name (e.g. "presented findings to the manager" for "stakeholder communication") is classed as missing: conservative by design.
-  Resume headings decide whether a quote is "listed" or "applied"; unusual layouts may be classed as "mentioned".
+  phrasing can be misread in either direction.
+- **Quotes must name the skill.** A genuine example that never uses the skill's name (e.g. "presented findings to the manager"
+  for "stakeholder communication") is classed as missing. This is conservative by design.
+- **Layout matters.** Resume headings decide whether a quote is "listed" or "applied"; unusual layouts may be classed as "mentioned".
 - **Requirement categories** are read from wording and can be wrong on unusual job descriptions.
-- **Scoring variability:** the 60 judgement points vary between runs and models; compare repeated runs (`--runs 3`).
-- Resume and job text are sent to Groq: use synthetic or consented data.
+- **Scoring variability:** the 60 judgement points vary between runs and models. Compare repeated runs (`--runs 3`).
+- **Textual evidence only:** the app cannot prove the candidate is competent.
+- **Free Groq limits apply** (requests and tokens per minute and per day). On a public deployment all visitors share them.
+- **Privacy:** resume and job text are sent to Groq. Use synthetic or consented data.
+- Editing the resume, upload or job description clears the previous result and chat on purpose.
