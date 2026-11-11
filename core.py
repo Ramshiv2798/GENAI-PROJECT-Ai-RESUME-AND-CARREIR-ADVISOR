@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import re
@@ -7,10 +8,11 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
+from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
+log = logging.getLogger("resume_screener")  # full details go here, short messages go to the UI
 
 # ============================================================
 # 1. Configuration
@@ -22,6 +24,10 @@ MAX_JD_CHARS = 12000
 MAX_FILE_MB = 5
 MIN_RESUME_CHARS = 50
 MIN_JD_CHARS = 30
+API_TIMEOUT_SECONDS = 60  # per request; the Groq client's own retries are switched off
+API_ATTEMPTS = 3          # app-level attempts per call, waiting 2 s then 4 s between them
+MAX_ANALYSIS_ATTEMPTS = 3  # model calls when the analysis fails validation (corrected reply requested)
+SUPPORTED_SUFFIXES = (".pdf", ".txt")
 
 # Four score components. The total is always added up in Python.
 SCORE_LIMITS = {
@@ -33,14 +39,18 @@ SCORE_LIMITS = {
 
 # --- Scoring rule for skills_coverage (calculated by this code, not by the model) ---
 #   skills_coverage = 40 * (sum of credit over required skills) / (number of required skills)
-# A required skill earns credit only if the model supplied a quote that (a) exists in
-# the resume and (b) actually names that skill. How much credit depends on WHERE the
-# quote sits in the resume:
-#   applied   - the quote is in an Experience / Projects section and is a real sentence
-#               (4+ words), so it shows the skill being used          -> 1.0
-#   listed    - the quote is in a Skills / Tools section: a mention only  -> 0.5
-#   mentioned - the quote is elsewhere (summary, education, no heading)   -> 0.5
-#   missing   - no valid quote                                            -> 0.0
+# Only MANDATORY job requirements are counted (preferred / "nice to have" skills are shown
+# separately; skills the job description says are not required are ignored). Alternatives
+# such as "Tableau or Power BI" are ONE requirement, satisfied by either.
+# A requirement earns credit only if the model supplied a quote that (a) exists in the resume,
+# (b) actually names that skill, and (c) does not say the skill was NOT used or is only a
+# plan to learn it. This verifies TEXTUAL evidence; it does not prove competency.
+#   applied   - the quote sits in an Experience / Projects sentence (4+ words) that
+#               describes doing something with the skill (action verb)     -> 1.0
+#   listed    - the quote is in a Skills / Tools section: a mention only    -> 0.5
+#   mentioned - anything else (summary, education, no heading, no action)   -> 0.5
+#   rejected  - not in the resume, does not name the skill, negated
+#               ("never used X") or a future plan ("plan to learn X")       -> 0.0 (missing)
 EVIDENCE_CREDIT = {"applied": 1.0, "listed": 0.5, "mentioned": 0.5}
 
 # The other three components are the model's judgement. Code can only enforce their
@@ -62,7 +72,7 @@ def get_client():
             )
         from groq import Groq
 
-        _client = Groq(api_key=key)
+        _client = Groq(api_key=key, timeout=API_TIMEOUT_SECONDS, max_retries=0)
     return _client
 
 
@@ -82,6 +92,7 @@ Return ONLY a valid JSON object with exactly these keys:
 {
   "candidate_skills": [string],
   "required_skills": [string],
+  "preferred_skills": [string],
   "matched_skills": [{"skill": string, "evidence": string}],
   "missing_skills": [string],
   "score_breakdown": {
@@ -105,14 +116,20 @@ Scoring rubric (apply every time):
 - education_clarity (0-15): education, certifications, resume clarity
 
 Skill classification rules:
-- "required_skills" = the skills, tools and requirements named in the job
-  description. Do not add anything the job description does not mention.
+- "required_skills" = the MANDATORY skills, tools and requirements named in the
+  job description. Do not add anything the job description does not mention.
+- "preferred_skills" = skills the job description calls optional, preferred,
+  "nice to have", "a plus" or a bonus. Skills it says are "not required" go in
+  neither list. If it offers alternatives ("Tableau or Power BI"), list each
+  alternative in required_skills; one of them is enough.
 - EVERY required skill must appear in exactly one of "matched_skills" or
   "missing_skills". Never put the same skill in both lists.
 - A matched skill needs "evidence": a SHORT quote (under 200 characters) copied
   EXACTLY, word for word, from the resume, and the quote must itself contain
   the name of that skill. A quote about something else (a degree, a date, a
-  different tool) is NOT evidence.
+  different tool) is NOT evidence. A sentence saying the candidate has NOT used
+  the skill ("never used X") or only plans to learn it ("will learn X next
+  month") is NOT evidence either: that skill is missing.
 - Prefer a quote from experience or projects that shows the skill being used
   over a quote from a skills list. If you can only quote a skills list, that is
   acceptable but earns less credit.
@@ -156,6 +173,7 @@ FEW_SHOT_ASSISTANT = json.dumps(
             "Python", "SQL", "Tableau", "Statistics",
             "A/B Testing", "Stakeholder Communication",
         ],
+        "preferred_skills": [],
         "matched_skills": [
             {"skill": "Python", "evidence": "Sales dashboard built in Python using Pandas and Matplotlib."},
             {"skill": "SQL", "evidence": "Skills: Python, SQL, Pandas, Excel"},
@@ -223,13 +241,14 @@ def read_resume(file_path, pasted_text):
         suffix = path.suffix.lower()
         if suffix == ".pdf":
             try:
-                pages = PyPDFLoader(str(path)).load()
+                reader = PdfReader(str(path))
+                pages = [page.extract_text() or "" for page in reader.pages]
             except Exception as error:
                 raise ValueError(
                     "The PDF could not be read. It may be corrupted or password-protected."
                 ) from error
-            text = "\n".join(page.page_content for page in pages)
-        elif suffix in (".txt", ".md"):
+            text = "\n".join(pages)
+        elif suffix == ".txt":
             text = path.read_text(encoding="utf-8", errors="ignore")
         else:
             raise ValueError("Unsupported file type. Upload a PDF or TXT file.")
@@ -342,15 +361,19 @@ def _build_kwargs(messages, max_tokens, temperature, json_mode):
 
 def _friendly_error(error):
     name, message = type(error).__name__, str(error)
+    log.warning("Groq call failed: %s: %s", name, message)  # details stay in the log
     if name == "AuthenticationError" or "invalid_api_key" in message:
         return "Invalid GROQ_API_KEY. Check your .env file or secret."
     if name == "RateLimitError" or "rate limit" in message.lower():
         return "Groq rate limit reached. Wait a minute and try again, or choose a lighter model."
-    return f"The Groq service is unavailable. Please try again. Details: {message}"
+    if name in ("APITimeoutError", "Timeout", "TimeoutError") or "timed out" in message.lower():
+        return f"The Groq service did not answer within {API_TIMEOUT_SECONDS} seconds. Please try again."
+    return "The Groq service is unavailable. Please try again in a moment."
 
 
-def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attempts=3):
-    """Call Groq with retries. Raises RuntimeError with a clear message."""
+def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attempts=API_ATTEMPTS):
+    """Call Groq with retries (timeout API_TIMEOUT_SECONDS each, 2 s then 4 s pause between
+    attempts for transient errors; no retry for a bad key). Raises RuntimeError."""
     last_error = None
 
     for attempt in range(1, attempts + 1):
@@ -373,7 +396,10 @@ def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attem
                 json_mode = False  # model may not support JSON mode; parser still extracts JSON
                 continue
             if name == "BadRequestError":
-                raise RuntimeError(f"Groq rejected the request: {error}") from error
+                log.warning("Groq rejected the request: %s", error)
+                raise RuntimeError(
+                    "The model service rejected the request. Try again, or choose another MODEL_NAME."
+                ) from error
             if isinstance(error, RuntimeError):
                 raise
             if attempt < attempts:
@@ -537,6 +563,169 @@ def scan_jd_skills(job_text):
     return found
 
 
+def _variant_spans(variant, text):
+    """(start, end) of every whole-word occurrence of one name/alias in text."""
+    if len(variant) <= 2:  # 'R', 'JS', 'ML': only as a stand-alone, capitalised token
+        forms = {variant.upper(), variant.capitalize()}
+        pattern = r"(?<![A-Za-z0-9+#.&])(?:%s)(?![A-Za-z0-9+#&])" % "|".join(map(re.escape, forms))
+        return [m.span() for m in re.finditer(pattern, text)]
+    pattern = r"(?<![a-z0-9+#])" + re.escape(variant) + r"(?:s|es)?(?![a-z0-9])"
+    return [m.span() for m in re.finditer(pattern, text.lower())]
+
+
+def skill_spans(skill, text):
+    """Sorted spans where the skill (or an alias) is named in text; [] if only loosely present."""
+    spans = []
+    for variant in skill_variants(skill):
+        spans.extend(_variant_spans(variant, text))
+    return sorted(spans)
+
+
+# ---------- Job-description requirement categories ----------
+# mandatory = required (default) | preferred = optional / nice to have | excluded = "not required"
+_MAND_HEAD = (r"required(?: skills)?|requirements?|must[- ]haves?|mandatory|essential|"
+              r"minimum qualifications?|basic qualifications?|what you(?:'ll| will)? need")
+_PREF_HEAD = (r"nice[- ]to[- ]haves?|preferred(?: qualifications| skills)?|bonus(?: points)?|"
+              r"desirable|good to have|optional|pluses|additional skills")
+_JD_HEADING = {
+    "mandatory": (re.compile(rf"^\W*(?:{_MAND_HEAD})\W*$", re.I),
+                  re.compile(rf"^\W*(?:{_MAND_HEAD})\s*[:\-\u2013\u2014]\s*(\S.*)$", re.I)),
+    "preferred": (re.compile(rf"^\W*(?:{_PREF_HEAD})\W*$", re.I),
+                  re.compile(rf"^\W*(?:{_PREF_HEAD})\s*[:\-\u2013\u2014]\s*(\S.*)$", re.I)),
+}
+_EXCLUDED_CUE = re.compile(
+    r"\b(?:not|isn't|aren't|never)\s+(?:be\s+)?(?:required|needed|necessary|expected|essential|mandatory|a requirement)\b"
+    r"|\bno\s+(?:need|requirement)\b|\b(?:don't|do not|doesn't|does not)\s+(?:need|require)\b"
+    r"|\bunnecessary\b", re.I)
+_PREFERRED_CUE = re.compile(
+    r"\b(?:nice[- ]to[- ]have|optional(?:ly)?|preferred|desirable|good to have|bonus|"
+    r"an? (?:plus|advantage)|is (?:a )?plus|beneficial|ideally|would be (?:a )?(?:plus|nice|great|helpful|an advantage))\b",
+    re.I)
+_CONNECTOR = re.compile(r"\s*(?:,\s*)?(?:(?:and/)?or|/)\s*", re.I)
+
+
+def parse_jd_units(job_text):
+    """[(sentence, category)] with category mandatory / preferred / excluded.
+    Uses headings ('Required:', 'Nice to have:'), inline cues ('is optional', 'not required')
+    and defaults to mandatory. A heuristic: it reads the wording, it does not understand it."""
+    units, section = [], "mandatory"
+    for raw in job_text.splitlines():
+        line = raw.strip().lstrip("-*\u2022\u25cf\u25aa \t").strip()
+        if not line:
+            continue
+        for name, (heading_only, _) in _JD_HEADING.items():
+            if heading_only.match(line):
+                section = name
+                break
+        else:
+            if line.endswith(":") and len(line.split()) <= 5:
+                section = "mandatory"  # some other heading, e.g. 'Responsibilities:'
+                continue
+            for sentence in re.split(r"(?<=[.;!?])\s+|\s+(?:but|while|whereas)\s+", line):
+                sentence, category = sentence.strip(), section
+                if not sentence:
+                    continue
+                for name, (_, inline) in _JD_HEADING.items():
+                    match = inline.match(sentence)
+                    if match:
+                        category, sentence = name, match.group(1)
+                        break
+                if _EXCLUDED_CUE.search(sentence):
+                    category = "excluded"
+                elif _PREFERRED_CUE.search(sentence):
+                    category = "preferred"
+                units.append((sentence, category))
+            continue
+        continue  # heading-only line
+    return units
+
+
+def jd_category(skill, units):
+    """mandatory / preferred / excluded for a skill, or None if the job description never names it.
+    If sentences disagree: an explicit 'not required' wins, then mandatory, then preferred."""
+    cats = {category for sentence, category in units if skill_in_text(skill, sentence)}
+    if not cats:
+        return None
+    for category in ("excluded", "mandatory", "preferred"):
+        if category in cats:
+            return category
+    return None
+
+
+def alternative_groups(units):
+    """Sets of canonical skill keys the job description offers as alternatives ('Tableau or Power BI')."""
+    groups = []
+    for sentence, category in units:
+        if category != "mandatory":
+            continue
+        found = []
+        for skill in KNOWN_SKILLS:
+            for start, end in skill_spans(skill, sentence):
+                found.append((start, end, canon_key(skill)))
+        found.sort()
+        chain = [found[0]] if found else []
+        for previous, current in zip(found, found[1:]):
+            if previous[2] != current[2] and _CONNECTOR.fullmatch(sentence[previous[1]:current[0]]):
+                chain.append(current)
+            else:
+                if len(chain) > 1:
+                    groups.append({c[2] for c in chain})
+                chain = [current]
+        if len(chain) > 1:
+            groups.append({c[2] for c in chain})
+    return groups
+
+
+# --- how does the resume talk about the skill? (negated / future plan / positive) ---
+_NEG_BEFORE = re.compile(
+    r"\b(?:never|not|without|lacks?|lacking|hasn't|haven't|hadn't|don't|doesn't|didn't|cannot|can't|"
+    r"unable to|unfamiliar with|no (?:prior |previous |hands-on |practical )?(?:experience|exposure|knowledge|background))\b",
+    re.I)
+_NEG_AFTER = re.compile(r"\b(?:not|never)\b|n't\b", re.I)
+_PLAN = re.compile(
+    r"\b(?:plan(?:s|ning|ned)? to|will (?:learn|study|start|begin|be learning)|going to|want(?:s|ed)? to|"
+    r"wish(?:es)? to|intend(?:s|ed|ing)? to|hope to|aim(?:s|ing)? to|look(?:ing)? to|"
+    r"(?:currently |am |i'm )?(?:learning|studying)|yet to|next (?:month|year|week|quarter)|"
+    r"in the future|interested in|to be learned)\b", re.I)
+_ACTION = re.compile(
+    r"\b(?:built|wrote|ran|led|made|took|drove|used|set up|cut|grew|saw)\b|\b[a-z]{3,}ed\b|^\W*[a-z]{3,}ing\b",
+    re.I)
+
+
+def skill_stance(skill, sentence):
+    """'negated' (says it was not used), 'planned' (only a plan to learn it) or 'positive'."""
+    spans = skill_spans(skill, sentence)
+    if spans:
+        start, end = spans[0]
+        before = " ".join(sentence[:start].split()[-6:])
+        # stop reading after the skill at the next clause ("... Tableau and never used Kubernetes")
+        after = re.split(r"\s+(?:and|but)\s+|;", sentence[end:], maxsplit=1)[0]
+        after = " ".join(after.split()[:6])
+    else:
+        before, after = sentence, ""
+    if _NEG_BEFORE.search(before) or _NEG_AFTER.search(after):
+        return "negated"
+    if _PLAN.search(sentence):
+        return "planned"
+    return "positive"
+
+
+def _sentences(line):
+    return [x.strip() for x in re.split(r"(?<=[.!?;])\s+", line) if x.strip()]
+
+
+def _context_sentences(part, lines):
+    """The resume sentence(s) the quote comes from, so 'never used Kubernetes' cannot be
+    hidden by quoting only 'Kubernetes in any project'. Falls back to the quote itself."""
+    needle, found = _norm(part), []
+    for line in lines or []:
+        if needle and needle in _norm(line):
+            found.extend(s for s in _sentences(line) if needle in _norm(s) or _norm(s) in needle)
+            if not found:
+                found.append(line)
+    return found or [part]
+
+
 # --- where in the resume does a quote sit? ---
 _BULLETS = "•●▪◦·■□➢➤►‣⁃"
 
@@ -564,25 +753,30 @@ def _norm(text):
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def _resume_segments(text):
-    """[(section name or None, normalised line)] using headings like 'Skills:' or 'EXPERIENCE'."""
-    segments, current = [], None
-    skip_next = 0  # lines still to ignore because they continue an instruction-like line
+def _clean_lines(text):
+    """Non-empty resume lines, WITHOUT text that tries to instruct the AI. A quote taken from
+    such text must not earn skill credit. The flagged line and the line that continues it are
+    dropped. Trade-off: an honest line containing e.g. "system prompt" is dropped too, so that
+    skill falls back to missing rather than being credited."""
+    skip_next = 0
     for line in text.splitlines():
         line = line.strip()
         if not line:
             skip_next = 0
             continue
-        # Text that tries to instruct the AI is not resume evidence: a quote taken from it
-        # must not earn skill credit. The flagged line and the line that continues it are
-        # dropped. Trade-off: an honest line containing e.g. "system prompt" is dropped too,
-        # so that skill falls back to missing rather than being credited.
         if detect_injection(line):
             skip_next = 1
             continue
         if skip_next:
             skip_next -= 1
             continue
+        yield line
+
+
+def _resume_segments(text):
+    """[(section name or None, normalised line)] using headings like 'Skills:' or 'EXPERIENCE'."""
+    segments, current = [], None
+    for line in _clean_lines(text):
         handled = False
         for name, (inline, heading) in _SECTION_RES.items():
             if heading.match(line):
@@ -614,10 +808,14 @@ def _locate_kind(part, segments):
     return max(kinds, key=lambda k: _KIND_RANK[k])
 
 
-def check_evidence(skill, evidence, segments):
+def check_evidence(skill, evidence, segments, lines=None):
     """
-    Decide whether a quote supports THIS skill. Returns (ok, reason, evidence_type).
-    Two separate tests: (1) the quote exists in the resume, (2) the quote names the skill.
+    Decide whether a quote is TEXTUAL evidence for THIS skill. Returns (ok, reason, evidence_type).
+    Tests: (1) the quote exists in the resume, (2) it names the skill, (3) the resume sentence
+    does not say the skill was NOT used or is only a plan to learn it, and (4) 'applied' credit
+    also needs an experience/project sentence that describes doing something (an action verb).
+    `lines` = the cleaned resume lines, used to read the whole sentence around a short quote.
+    This does not prove competency: it only checks what the resume text says.
     """
     parts = [p.strip() for p in re.split(r"\.\.\.|\u2026", evidence) if len(p.strip()) >= 5]
     if not parts:
@@ -630,9 +828,24 @@ def check_evidence(skill, evidence, segments):
             return False, f'the quote "{part[:60]}" was not found in the resume', None
         located.append((part, kind))
 
-    supporting = [kind for part, kind in located if skill_in_text(skill, part)]
-    if not supporting:
+    named = [(part, kind) for part, kind in located if skill_in_text(skill, part)]
+    if not named:
         return False, f'the quote exists in the resume but does not mention "{skill}"', None
+
+    supporting, refusals = [], []
+    for part, kind in named:
+        context = [c for c in _context_sentences(part, lines) if skill_in_text(skill, c)] or [part]
+        stances = [skill_stance(skill, c) for c in context]
+        if "positive" not in stances:
+            refusals.append(stances[0])
+            continue
+        if kind == "applied" and not any(_ACTION.search(c) for c in context):
+            kind = "mentioned"  # in an experience section, but no sentence about doing anything
+        supporting.append(kind)
+    if not supporting:
+        if refusals[0] == "negated":
+            return False, f'the resume says "{skill}" was NOT used, so this is not evidence of it', None
+        return False, f'the resume only describes a plan to learn "{skill}", which is not evidence of use', None
     return True, "", max(supporting, key=lambda k: _KIND_RANK[k])
 
 
@@ -700,7 +913,7 @@ def validate_analysis(data, resume_text, job_text, strict=True):
     if absent:
         raise ValueError("missing required fields: " + ", ".join(absent))
 
-    candidate = _string_list(data["candidate_skills"], "candidate_skills", allow_empty=True)
+    candidate_raw = _string_list(data["candidate_skills"], "candidate_skills", allow_empty=True)
     required_raw = _string_list(data["required_skills"], "required_skills")
     missing_raw = _string_list(data["missing_skills"], "missing_skills", allow_empty=True)
 
@@ -740,78 +953,147 @@ def validate_analysis(data, resume_text, job_text, strict=True):
 
     problems = []  # everything a corrected reply would need to fix
 
-    # --- 1. required skills must come from the job description, and none may be forgotten ---
-    required, seen = [], set()
-    for name in required_raw:
+    notes = []  # worth telling the user, but no corrected reply is needed
+    units = parse_jd_units(job_text)
+
+    # --- 1. split the job description's skills into mandatory / preferred; ignore "not required" ---
+    required, preferred, seen = [], [], set()
+
+    def classify(name, listed_as):
+        """Place one skill name by what the JOB DESCRIPTION says, not by what the model says."""
         key = canon_key(name)
         if key in seen:
-            continue  # duplicate or alias of a skill already listed
+            return  # duplicate or alias of a skill already handled
         seen.add(key)
-        if skill_in_text(name, job_text):
+        category = jd_category(name, units)
+        if category is None:
+            if listed_as != "scan":
+                problems.append(f'{listed_as} skill "{name}" is not mentioned in the job description')
+        elif category == "excluded":
+            notes.append(f'"{name}" is ignored: the job description says it is not required.')
+        elif category == "preferred":
+            preferred.append(name)
+            if listed_as == "required":
+                notes.append(f'"{name}" was listed as required but the job description calls it optional/preferred; '
+                             "it is shown separately and does not count toward the skills score.")
+        else:  # mandatory
             required.append(name)
-        else:
-            problems.append(f'required skill "{name}" is not mentioned in the job description')
-    for name in scan_jd_skills(job_text):
-        key = canon_key(name)
-        if key not in seen:
-            seen.add(key)
-            required.append(name)
-            problems.append(f'"{name}" is named in the job description but was missing from required_skills')
-    if not required:
-        raise ValueError("none of the required_skills appear in the job description")
-    required_by_key = {canon_key(name): name for name in required}
+            if listed_as == "preferred":
+                problems.append(f'"{name}" is mandatory in the job description but was listed as preferred')
+            elif listed_as == "scan":
+                problems.append(f'"{name}" is named in the job description but was missing from required_skills')
 
-    # --- 2. matched skills: evidence must exist in the resume AND name that skill ---
+    for name in required_raw:
+        classify(name, "required")
+    for name in _string_list(data.get("preferred_skills", []), "preferred_skills", allow_empty=True):
+        classify(name, "preferred")
+    for name in scan_jd_skills(job_text):
+        classify(name, "scan")
+    if not required:
+        raise ValueError("no mandatory skills from the job description could be identified")
+
+    # --- 2. requirement units: alternatives ("Tableau or Power BI") count as ONE requirement ---
+    required_by_key = {canon_key(n): n for n in required}
+    preferred_by_key = {canon_key(n): n for n in preferred}
+    unit_keys, taken = [], set()
+    for group in alternative_groups(units):
+        members = [k for k in required_by_key if k in group]
+        if len(members) >= 2:
+            unit_keys.append(members)
+            taken.update(members)
+    unit_keys += [[k] for k in required_by_key if k not in taken]
+    unit_keys.sort(key=lambda members: list(required_by_key).index(members[0]))
+    unit_of = {k: i for i, members in enumerate(unit_keys) for k in members}
+    unit_names = [" or ".join(required_by_key[k] for k in members) for members in unit_keys]
+
+    # --- 3. matched skills: the quote must exist in the resume, name THAT skill, and not be
+    #        negated or a plan ---
     segments = _resume_segments(resume_text)
+    lines = list(_clean_lines(resume_text))
     verified, rejected = {}, set()
     for item in matched_raw:
         skill, evidence = item["skill"].strip(), item["evidence"].strip()
         key = canon_key(skill)
-        if key not in required_by_key:
-            problems.append(f'"{skill}" is listed as matched but is not a required skill')
+        name = required_by_key.get(key) or preferred_by_key.get(key)
+        if name is None:
+            if jd_category(skill, units) == "excluded":
+                notes.append(f'"{skill}" was listed as matched but the job description says it is not required.')
+            else:
+                problems.append(f'"{skill}" is listed as matched but is not a required skill')
             continue
         if key in verified:
             continue  # duplicate entry
-        ok, reason, kind = check_evidence(required_by_key[key], evidence, segments)
+        ok, reason, kind = check_evidence(name, evidence, segments, lines)
         if ok:
-            verified[key] = {
-                "skill": required_by_key[key], "evidence": evidence, "evidence_type": kind,
-            }
+            verified[key] = {"skill": name, "evidence": evidence, "evidence_type": kind}
         else:
             rejected.add(key)
-            problems.append(f'"{required_by_key[key]}": {reason}')
+            problems.append(f'"{name}": {reason}')
 
-    # --- 3. reconcile matched / missing so every required skill sits in exactly one list ---
+    # --- 4. reconcile matched / missing so every requirement sits in exactly one list ---
     missing_keys = set()
     for name in missing_raw:
         key = canon_key(name)
         if key in required_by_key:
             missing_keys.add(key)
+        elif key in preferred_by_key or jd_category(name, units) == "excluded":
+            continue  # preferred or not-required skills are never scored, so listing them is harmless
         else:
             problems.append(f'"{name}" is listed as missing but is not a required skill')
     for key in sorted(missing_keys & set(verified)):
         problems.append(f'"{required_by_key[key]}" appears in both matched_skills and missing_skills')
         missing_keys.discard(key)  # repair: verified evidence wins
-    for key, name in required_by_key.items():
-        if key not in verified and key not in missing_keys:
-            if key not in rejected:
-                problems.append(f'required skill "{name}" is in neither matched_skills nor missing_skills')
-            missing_keys.add(key)  # repair: no verified evidence -> missing
+    satisfied = {unit_of[k] for k in verified if k in unit_of}
+    for index, members in enumerate(unit_keys):
+        if index in satisfied:
+            continue
+        if not (set(members) & missing_keys) and not (set(members) & rejected):
+            problems.append(f'required skill "{unit_names[index]}" is in neither matched_skills nor missing_skills')
 
     if problems and strict:
         raise EvidenceError("; ".join(problems))
 
-    matched = [verified[k] for k in required_by_key if k in verified]
-    missing_skills = [name for k, name in required_by_key.items() if k in missing_keys]
+    # --- 5. candidate skills: only those that really appear in the resume text are kept ---
+    clean_text = "\n".join(lines)
+    candidate, unverified_candidate, seen_candidate = [], [], set()
+    for name in candidate_raw:
+        key = canon_key(name)
+        if key in seen_candidate:
+            continue
+        seen_candidate.add(key)
+        (candidate if skill_in_text(name, clean_text) else unverified_candidate).append(name)
+    if unverified_candidate:
+        notes.append(
+            "These skills were extracted by the model but were NOT found in the resume text, so they "
+            "are not treated as facts about the candidate and are not given to the advisor: "
+            + ", ".join(unverified_candidate) + "."
+        )
 
-    # --- 4. skills score is calculated from verified evidence, never copied from the model ---
+    matched = [verified[k] for k in required_by_key if k in verified]
+    missing_skills = [unit_names[i] for i in range(len(unit_keys)) if i not in satisfied]
+    preferred_out = []
+    for key, name in preferred_by_key.items():
+        entry = verified.get(key)
+        preferred_out.append({
+            "skill": name,
+            "status": "shown" if entry else "not shown",
+            "evidence_type": entry["evidence_type"] if entry else None,
+            "evidence": entry["evidence"] if entry else None,
+        })
+
+    # --- 6. skills score is calculated from verified evidence of MANDATORY skills only ---
+    best_types = []
+    for index, members in enumerate(unit_keys):
+        kinds = [verified[k]["evidence_type"] for k in members if k in verified]
+        if kinds:
+            best_types.append(max(kinds, key=lambda kind: _KIND_RANK[kind]))
     model_estimate = breakdown["skills_coverage"]
-    skills_points = calculate_skills_points([m["evidence_type"] for m in matched], len(required))
+    skills_points = calculate_skills_points(best_types, len(unit_keys))
     breakdown["skills_coverage"] = skills_points
     fit_score = sum(breakdown.values())
 
-    counts = {kind: sum(1 for m in matched if m["evidence_type"] == kind) for kind in EVIDENCE_CREDIT}
-    warnings = []
+    counts = {kind: best_types.count(kind) for kind in EVIDENCE_CREDIT}
+    warnings = list(notes)
     if problems:
         warnings.extend(f"Skill check: {p}." for p in problems)
         warnings.append(
@@ -827,7 +1109,9 @@ def validate_analysis(data, resume_text, job_text, strict=True):
 
     result = {
         "candidate_skills": candidate,
-        "required_skills": required,
+        "unverified_candidate_skills": unverified_candidate,
+        "required_skills": unit_names,
+        "preferred_skills": preferred_out,
         "matched_skills": matched,
         "missing_skills": missing_skills,
         "score_breakdown": breakdown,
@@ -835,7 +1119,7 @@ def validate_analysis(data, resume_text, job_text, strict=True):
         "score_reasoning": reasoning.strip(),
         "suggestions": suggestions,
         "skills_basis": {
-            "required": len(required),
+            "required": len(unit_keys),
             "applied": counts["applied"],
             "listed": counts["listed"],
             "mentioned": counts["mentioned"],
@@ -869,7 +1153,7 @@ def inflation_warning(breakdown, text_was_flagged):
 # ============================================================
 # 7. Analysis pipeline
 # ============================================================
-def run_analysis(file_path, pasted_text, job_description, max_attempts=3):
+def run_analysis(file_path, pasted_text, job_description, max_attempts=MAX_ANALYSIS_ATTEMPTS):
     """Read inputs, call the model, validate. Returns a state dict or raises."""
     if not job_description or len(job_description.strip()) < MIN_JD_CHARS:
         raise ValueError("Please enter the job description (at least a couple of lines).")
@@ -892,8 +1176,11 @@ def run_analysis(file_path, pasted_text, job_description, max_attempts=3):
     flagged = detect_injection(resume_raw) or detect_injection(job_description)
     if flagged:
         warnings.append(
-            "The text contains wording that looks like instructions to the AI. It was "
-            "treated as plain content and did not change the scoring rules."
+            "The text contains wording that looks like instructions to the AI. The app marked "
+            "it as untrusted data and ignores it as skill evidence, and the skills score is "
+            "calculated by code from verified quotes. The other three components "
+            "(experience, projects, education: 60 of 100 points) are model judgements that "
+            "this app cannot verify, so they may still have been influenced: please review them."
         )
 
     messages = [
@@ -947,9 +1234,10 @@ def run_analysis(file_path, pasted_text, job_description, max_attempts=3):
             "warnings": warnings,
         }
 
+    log.warning("Analysis failed validation %d times; last problem: %s", max_attempts, last_error)
     raise RuntimeError(
-        f"The model did not return a valid analysis after {max_attempts} attempts "
-        f"({last_error}). Please try again."
+        f"The model did not return a valid analysis after {max_attempts} attempts. "
+        "Please try again."
     )
 
 
@@ -963,7 +1251,7 @@ def format_report(state):
         return "\n".join(f"- {item}" for item in items) if items else "- None"
 
     type_label = {
-        "applied": "shown in use",
+        "applied": "described as used",
         "listed": "listed only",
         "mentioned": "mentioned only",
     }
@@ -973,9 +1261,9 @@ def format_report(state):
     ) or "- None"
 
     skills_note = (
-        f"Calculated by the app from verified evidence: {basis['applied']} shown in use, "
+        f"Calculated by the app from quotes found in the resume: {basis['applied']} described as used, "
         f"{basis['listed'] + basis['mentioned']} listed/mentioned only, {basis['missing']} missing "
-        f"of {basis['required']} required"
+        f"of {basis['required']} mandatory requirements"
     )
     rows = []
     for key, limit in SCORE_LIMITS.items():
@@ -983,6 +1271,13 @@ def format_report(state):
         rows.append(f"| {key.replace('_', ' ').title()} | {r['score_breakdown'][key]} / {limit} | {how} |")
     rows = "\n".join(rows)
 
+    preferred = ""
+    if r.get("preferred_skills"):
+        preferred = "### Preferred / Nice-to-have Skills (not part of the skills score)\n" + "\n".join(
+            f'- **{p["skill"]}**: '
+            + (f'{type_label[p["evidence_type"]]} — evidence: "{p["evidence"]}"' if p["evidence_type"] else "not shown")
+            for p in r["preferred_skills"]
+        ) + "\n\n"
     suggestions = "\n".join(f"{i}. {s}" for i, s in enumerate(r["suggestions"], 1))
     warnings = ""
     if state.get("warnings"):
@@ -996,11 +1291,17 @@ def format_report(state):
 |---|---|---|
 {rows}
 
-### Matched Skills (verified against the resume)
+### Matched Skills (a quote was found in the resume that names the skill)
 {matched}
 
-### Missing Skills
+### Missing Skills (mandatory requirements with no usable evidence)
 {bullets(r['missing_skills'])}
+
+{preferred}> **What this score is.** An application-specific comparison of this resume with this job
+> description, not an ATS score and not a hiring decision. The app checks that quotes exist, name the
+> skill and are not negated or only planned: that is textual evidence, not proof of competency.
+> Only the skills component ({basis['calculated']}/40) is calculated by code; the other three
+> components are the model's judgement and are not verified.
 
 ### 3 Suggestions to Improve Your Resume
 {suggestions}
@@ -1017,18 +1318,32 @@ def safe_analyze(file_path, pasted_text, job_description):
         return state, format_report(state), state["analysis"]
     except (ValueError, RuntimeError) as error:
         return None, f"**Error:** {error}", None
-    except Exception as error:  # never leave stale state behind
-        return None, f"**Unexpected error:** {error}", None
+    except Exception:  # never leave stale state behind; details go to the log only
+        log.exception("Unexpected failure during analysis")
+        return None, (
+            "**Error:** Something unexpected went wrong while analysing. "
+            "Please try again; details were written to the application log."
+        ), None
 
 
 # ============================================================
 # 8. Career-advisor chat (streamed)
 # ============================================================
+def advisor_facts(analysis):
+    """The analysis as given to the advisor: unverified model output is left out or labelled."""
+    facts = {k: v for k, v in analysis.items() if k not in ("unverified_candidate_skills", "score_reasoning")}
+    if "score_reasoning" in analysis:
+        facts["model_narrative_NOT_VERIFIED"] = analysis["score_reasoning"]
+    return facts
+
+
 def build_chat_messages(message, history, state):
     context = (
         f"<resume>\n{sanitize_for_prompt(state['resume'])}\n</resume>\n\n"
         f"<job_description>\n{sanitize_for_prompt(state['jd'])}\n</job_description>\n\n"
-        f"FIT ANALYSIS (JSON):\n{json.dumps(state['analysis'], indent=2)}"
+        "FIT ANALYSIS (JSON). Skills lists were checked against the resume; "
+        "'model_narrative_NOT_VERIFIED' is the model's own explanation and may be wrong:\n"
+        f"{json.dumps(advisor_facts(state['analysis']), indent=2)}"
     )
     messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT + "\n\n" + context}]
     messages += [{"role": m["role"], "content": m["content"]} for m in (history or [])[-10:]]

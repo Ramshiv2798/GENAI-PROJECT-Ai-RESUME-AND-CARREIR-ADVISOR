@@ -57,6 +57,10 @@ def summarize(state: Any, result: Any, calls: int) -> dict[str, Any]:
         "skills_basis": result["skills_basis"],
         "matched": [(m["skill"], m["evidence_type"]) for m in result["matched_skills"]],
         "missing": result["missing_skills"],
+        "required": result["required_skills"],
+        "preferred": [(p["skill"], p["status"]) for p in result["preferred_skills"]],
+        "unverified_candidate_skills": result["unverified_candidate_skills"],
+        "suggestions": result["suggestions"],  # READ THESE: are they specific and grounded in the resume?
         "warnings": state["warnings"],
         "model_calls": calls,
     }
@@ -181,8 +185,31 @@ def l10():
         "JD asks for Docker/Kubernetes/Terraform/AWS/CI-CD which the resume does not show: none may be matched"), report
 
 
+def l11():
+    """Negated / planned statements must not become evidence (review round 2, correction 1)."""
+    state, report, result, calls = analyze(read("resume_negated.txt"), read("jd_devops.txt"))
+    forbidden = {"kubernetes", "terraform", "docker"}
+    ok = bool(state) and not (forbidden & matched_names(result))
+    return summarize(state, result, calls), ok, (
+        "resume says it never used Kubernetes, only plans Terraform and is still learning Docker: "
+        "none of the three may be matched"), report
+
+
+def l12():
+    """Required / optional / not-required wording in the job description (correction 2)."""
+    state, report, result, calls = analyze(read("resume_strong.txt"), read("jd_categories.txt"))
+    if not state:
+        return {"state": None}, False, "analysis must succeed", report
+    in_scope = " ".join(result["required_skills"] + result["missing_skills"]).lower()
+    ok = ("kubernetes" not in in_scope and "python" not in result["required_skills"]
+          and any("tableau" in r.lower() and "power bi" in r.lower() for r in result["required_skills"]))
+    return summarize(state, result, calls), ok, (
+        "Kubernetes (not required) is in neither list; Python (optional) is not in the denominator; "
+        "'Tableau or Power BI' is one requirement"), report
+
+
 CASES = {"L1": l1, "L2": l2, "L3": l3, "L3b": l3b, "L4": l4, "L5": l5, "L6": l6, "L7": l7,
-         "L8": l8, "L9": l9, "L10": l10}
+         "L8": l8, "L9": l9, "L10": l10, "L11": l11, "L12": l12}
 OFFLINE = {"L5"}
 
 
@@ -216,6 +243,19 @@ def main():
             md.append(f"## {label}: {verdict}\n\n**Rule:** {rule}\n\n```json\n"
                       f"{json.dumps(summary, indent=2, default=str)}\n```\n\n<details><summary>Full output</summary>\n\n"
                       f"{text}\n\n</details>\n")
+
+    # score stability: the model's output varies, so repeated runs show how much
+    stability = {}
+    for r in results:
+        score = r["summary"].get("fit_score") if isinstance(r["summary"], dict) else None
+        if score is not None:
+            stability.setdefault(r["case"].split(" (")[0], []).append(score)
+    if args.runs > 1 and stability:
+        lines = ["## Score stability across runs\n", "| Case | Scores | Range |", "|---|---|---|"]
+        for case_id, scores in stability.items():
+            lines.append(f"| {case_id} | {scores} | {max(scores) - min(scores)} points |")
+        md.append("\n".join(lines) + "\n")
+        print("\nScore stability:", {k: (min(v), max(v)) for k, v in stability.items()})
 
     (ROOT / "live_results.json").write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
     (ROOT / "live_results.md").write_text("\n".join(md), encoding="utf-8")

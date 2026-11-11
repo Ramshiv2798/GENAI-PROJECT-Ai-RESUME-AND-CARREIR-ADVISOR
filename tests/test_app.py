@@ -279,3 +279,114 @@ def test_ui05_clear_all_resets_everything(good_analysis, monkeypatch):
     assert DEFAULT_REPORT in all_markdown(at)
     assert len(at.json) == 0
     assert len(at.chat_message) == 0
+
+
+# =====================================================================================
+# UI06: editing the inputs after an analysis must invalidate it (review round 2)
+# =====================================================================================
+STATE_A = {"resume": RESUME, "jd": JD, "analysis": {"fit_score": 74}, "warnings": []}
+STATE_B = {"resume": OTHER_RESUME, "jd": JD, "analysis": {"fit_score": 12}, "warnings": []}
+
+
+@pytest.fixture
+def two_candidates(monkeypatch):
+    """safe_analyze returns candidate A's or B's analysis depending on the pasted text; the
+    advisor records which candidate's state it was given."""
+    seen_by_advisor = []
+
+    def fake_analyze(file_path, pasted_text, job_description):
+        if "Anita" in (pasted_text or "") or "Anita" in (Path(file_path).read_text() if file_path else ""):
+            return STATE_A, "## Fit Score: 74/100 (Moderate fit) - Anita", {"fit_score": 74}
+        return STATE_B, "## Fit Score: 12/100 (Weak fit) - Vikram", {"fit_score": 12}
+
+    def fake_stream(message, history, state):
+        seen_by_advisor.append(state)
+        yield "Answer about " + state["resume"][:5]
+
+    monkeypatch.setattr(core, "safe_analyze", fake_analyze)
+    monkeypatch.setattr(core, "chat_stream", fake_stream)
+    return seen_by_advisor
+
+
+def test_ui06_editing_the_resume_clears_the_old_analysis_and_chat(two_candidates):
+    at = analyze(new_app())                      # Candidate A analysed
+    ask(at, "What should I improve?")
+    assert at.session_state["state"] == STATE_A and len(at.session_state["messages"]) == 2
+
+    # the reviewer's sequence: replace the pasted text with Candidate B, do NOT click Analyze
+    at.text_area(key="resume_text").set_value(OTHER_RESUME).run()
+    assert not at.exception
+    assert at.session_state["state"] is None
+    assert at.session_state["result"] is None
+    assert at.session_state["messages"] == []
+    assert len(at.chat_message) == 0
+    assert "Anita" not in all_markdown(at)       # Candidate A's report is gone from the page
+    assert DEFAULT_REPORT in all_markdown(at)
+    assert any("changed" in i.value for i in at.info)
+
+    # the advisor cannot answer from Candidate A any more
+    ask(at, "And what about my skills?")
+    assert two_candidates == [STATE_A]           # advisor was called only before the edit
+    assert at.session_state["messages"][-1]["content"] == "Please analyze a resume and job description first."
+
+
+def test_ui06b_editing_the_job_description_also_invalidates(two_candidates):
+    at = analyze(new_app())
+    at.text_area(key="job_desc").set_value(JD + " Required: Docker.").run()
+    assert not at.exception
+    assert at.session_state["state"] is None and at.session_state["messages"] == []
+    assert DEFAULT_REPORT in all_markdown(at)
+
+
+def test_ui06c_unchanged_inputs_keep_the_analysis_and_chat(two_candidates):
+    at = analyze(new_app())
+    ask(at, "first question")
+    ask(at, "second question")                   # every interaction reruns the script
+    assert at.session_state["state"] == STATE_A
+    assert len(at.session_state["messages"]) == 4
+    assert two_candidates == [STATE_A, STATE_A]
+    assert not at.info
+
+
+def test_ui06d_after_invalidation_a_new_analysis_works_and_chat_uses_it(two_candidates):
+    at = analyze(new_app())
+    at.text_area(key="resume_text").set_value(OTHER_RESUME).run()
+    assert at.session_state["state"] is None
+    button(at, "Analyze").click().run()
+    assert not at.exception
+    assert at.session_state["state"] == STATE_B
+    assert not at.info                           # the "inputs changed" notice is gone
+    ask(at, "How do I improve?")
+    assert two_candidates == [STATE_B]
+
+
+def test_ui06e_reverting_the_edit_does_not_resurrect_the_old_analysis(two_candidates):
+    at = analyze(new_app())
+    at.text_area(key="resume_text").set_value(OTHER_RESUME).run()
+    at.text_area(key="resume_text").set_value(RESUME).run()   # typed the original text back
+    assert at.session_state["state"] is None                  # must analyze again, nothing stale returns
+    assert at.session_state["messages"] == []
+
+
+@pytest.mark.skipif(not HAS_UPLOAD_SUPPORT, reason="this Streamlit version's AppTest cannot upload files")
+def test_ui06f_replacing_the_uploaded_file_invalidates(two_candidates):
+    at = new_app()
+    at.file_uploader[0].upload("a.txt", RESUME.encode(), "text/plain")
+    at.text_area(key="job_desc").set_value(JD)
+    button(at, "Analyze").click().run()
+    assert at.session_state["state"] == STATE_A
+
+    at.file_uploader[0].upload("b.txt", OTHER_RESUME.encode(), "text/plain").run()
+    assert not at.exception
+    assert at.session_state["state"] is None and at.session_state["messages"] == []
+    assert DEFAULT_REPORT in all_markdown(at)
+
+
+def test_ui07_unexpected_error_details_are_not_shown_on_the_page(monkeypatch):
+    def secret_failure(f, t, j):
+        raise KeyError("secret internal detail")
+    monkeypatch.setattr(core, "safe_analyze", secret_failure)
+    at = analyze(new_app())
+    assert at.session_state["state"] is None
+    page = all_markdown(at)
+    assert "secret internal detail" not in page and "could not be completed" in page
