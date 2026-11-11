@@ -1,0 +1,17 @@
+Sana Iyer
+sana.iyer@example.com | Chennai, India (synthetic sample resume)
+
+SKILLS
+Linux, Python, Git
+
+EXPERIENCE
+Systems Support Intern, Northwind IT (4 months)
+- Automated log clean-up with Python scripts on Linux servers.
+
+PROJECTS
+- I have never used Kubernetes in any project.
+- I plan to learn Terraform next month.
+- Currently learning Docker through an online course.
+
+EDUCATION
+B.Sc Computer Science, 2025

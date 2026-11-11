@@ -1,0 +1,4 @@
+Data Analyst (Entry Level)
+
+Required: SQL and Tableau or Power BI. Python is optional. Kubernetes is not required.
+Bachelor's degree in a quantitative field.
