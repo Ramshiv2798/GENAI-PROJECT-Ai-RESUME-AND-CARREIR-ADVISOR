@@ -1,5 +1,18 @@
+# Environment Variables
 .env
+
+# Virtual Environment
+Bot/
+
+# Python Cache
 __pycache__/
+*.pyc
+
+# Pytest
 .pytest_cache/
+
+# Generated Files
 live_results.*
-.Bot/
+
+# VS Code
+.vscode/
