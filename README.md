@@ -43,7 +43,7 @@ requirements-dev.txt   Adds pytest
 .env.example           Template for your API key
 pytest.ini             Test settings
 samples/               Synthetic resumes and job descriptions (no real people)
-tests/test_core.py     100 offline tests of core.py (model mocked)
+tests/test_core.py     116 offline tests of core.py (model mocked)
 tests/test_app.py      23 interface tests with Streamlit AppTest (model mocked)
 docs/sample_output.md  Example report (stubbed model reply, see below)
 TESTING.md             Test plan, offline results, live-test table
@@ -51,21 +51,23 @@ TESTING.md             Test plan, offline results, live-test table
 `core.py` is long. If the project grows, split it into prompts, validation/scoring, and API/document reading.
 
 ## Setup
-1. Install Python 3.1 (the version the tests were run with; 3.10+ should work but is untested).
+1. Install **Python 3.11**. All tests were run with Python 3.11+; other versions have not been tested.
 2. Create a free Groq API key at https://console.groq.com/keys
-3. Clone the repository and open the project folder:
+3. Get the project and open a terminal in the project folder (the one that contains `app.py`):
+   - If you received a ZIP, unzip it.
+   - If it is on GitHub, press the green **Code** button, copy the HTTPS link, run `git clone` followed by that link,
+     then `cd` into the new folder.
+4. Create a virtual environment and install the dependencies:
    ```
-   git clone <YOUR-REPOSITORY-URL>      # TODO(author): replace with the real clone URL
-   cd <repository-folder>
    python -m venv .venv
    .venv\Scripts\activate               # Windows   (Mac/Linux: source .venv/bin/activate)
    pip install -r requirements.txt
    ```
-4. Copy `.env.example` to `.env` and put your key in it:
+5. Copy `.env.example` to `.env` (Windows: `copy .env.example .env`, Mac/Linux: `cp .env.example .env`) and put your key in it:
    ```
    GROQ_API_KEY=gsk_your_key_here
    ```
-5. Run the app:
+6. Run the app:
    ```
    streamlit run app.py
    ```
@@ -84,12 +86,15 @@ Settings are read from `.env` locally or from Streamlit secrets when deployed. N
 ## Run the tests
 ```
 pip install -r requirements-dev.txt
-pytest                          # offline: Groq is mocked, no key or network needed
-python live_tests.py --runs 3   # real model: needs GROQ_API_KEY in .env, writes live_results.md
+pytest                                    # offline: Groq is mocked, no key or network needed
+python live_tests.py --runs 3 --record    # real model: needs GROQ_API_KEY and internet access to Groq
 ```
-**Observed results.** Offline: 123 passed (100 core + 23 interface), last run 10 Nov 2026. These verify the
-application's behaviour under controlled model replies; they do **not** establish the real model's accuracy or
-consistency. Live: **not yet recorded** (needs a key); see `TESTING.md`.
+The live command writes `live_results.md` (full outputs and suggestions) and fills the live-test table in `TESTING.md`
+from the real results. It first makes one small test call, and if the key or network is wrong it stops without recording anything.
+
+**Observed results.** Offline: **139 passed** (116 core + 23 interface), last run 12 Nov 2026 on Python 3.12.3. These verify the
+application's behaviour under controlled model replies; they do **not** establish the real model's accuracy or consistency.
+Live: **not yet recorded.** It needs a Groq key and network access; see `TESTING.md`.
 
 ## How the analysis works
 1. `app.py` saves the upload to a temporary file inside `core.analyze_upload`, which also deletes it.
@@ -105,7 +110,7 @@ consistency. Live: **not yet recorded** (needs a key); see `TESTING.md`.
 ## How the score is calculated
 Total = skills coverage (40) + experience relevance (25) + projects and achievements (20) + education and clarity (15).
 
-**Skills coverage is calculated by the code:** `40 × credit ÷ mandatory requirements`, rounded.
+**Skills coverage is calculated by the code:** `40 x credit / mandatory requirements`, rounded.
 
 | Evidence for a mandatory requirement | Credit |
 |---|---|
@@ -119,6 +124,10 @@ Rules in detail:
 - Alternatives such as "Tableau or Power BI" count as one requirement, satisfied by either.
 - Categories come from the job description's wording (headings such as "Required:" / "Nice to have:" and cues such as
   "optional", "a plus", "not required"). Anything not marked is treated as mandatory.
+- The wording is read **clause by clause**, so one sentence can mix categories: "SQL is required, Python optional, Kubernetes
+  is not required" gives SQL mandatory, Python preferred, Kubernetes ignored. A cue in brackets or after a skill
+  ("Docker (preferred)", "Python is a plus") applies to that skill, and a plural cue ("Docker and Terraform are optional")
+  applies to the skills listed before it.
 
 **Model judgement (60 of 100 points):** experience relevance, projects and achievements, education and clarity.
 Code only enforces that each number is a finite value within its range.
@@ -215,9 +224,9 @@ More sample inputs:
 1. Push `app.py`, `core.py`, `requirements.txt` and `.gitignore` to a GitHub repository. Do **not** push `.env`.
 2. Go to https://share.streamlit.io, sign in with GitHub and click **Create app**.
 3. Select the repository, branch `main` and main file `app.py`.
-4. Open **Advanced settings → Secrets** and add: `GROQ_API_KEY = "gsk_your_key_here"`
+4. Open **Advanced settings -> Secrets** and add: `GROQ_API_KEY = "gsk_your_key_here"`
 5. Click **Deploy**.
-6. Add the deployed URL to the **Live demo** line at the top of this file.
+6. Optional: once deployed, add a line `Live demo: <your deployed address>` directly under the title of this file.
 
 ## Limitations
 - **Scanned PDFs:** no OCR. Paste the text instead.
@@ -228,7 +237,9 @@ More sample inputs:
 - **Quotes must name the skill.** A genuine example that never uses the skill's name (e.g. "presented findings to the manager"
   for "stakeholder communication") is classed as missing. This is conservative by design.
 - **Layout matters.** Resume headings decide whether a quote is "listed" or "applied"; unusual layouts may be classed as "mentioned".
-- **Requirement categories** are read from wording and can be wrong on unusual job descriptions.
+- **Requirement categories** are read from wording and can be wrong on unusual job descriptions. Known weak spots: a cue that
+  refers back to another sentence ("The latter is optional"), "either X or Y" meaning beyond a simple "X or Y", unusual headings,
+  and indirectly phrased negations. If the job description is ambiguous the skill is treated as mandatory.
 - **Scoring variability:** the 60 judgement points vary between runs and models. Compare repeated runs (`--runs 3`).
 - **Textual evidence only:** the app cannot prove the candidate is competent.
 - **Free Groq limits apply** (requests and tokens per minute and per day). On a public deployment all visitors share them.
