@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 
@@ -14,6 +15,7 @@ try:
 except Exception:
     pass  # no secrets file present
 import core  # noqa: E402
+import storage  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("resume_screener")  # details go to the log, short messages to the page
@@ -30,6 +32,7 @@ def init_state():
         "job_desc": "",
         "analyzed_sig": None,     # (file, pasted text, job description) used for the current analysis
         "notice": "",             # shown above the report, e.g. after inputs change
+        "history_note": "",       # result of saving the optional history summary
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -44,6 +47,7 @@ def reset_analysis():
     st.session_state.messages = []
     st.session_state.analyzed_sig = None
     st.session_state.notice = ""
+    st.session_state.history_note = ""
 
 
 def input_signature(uploaded_file, pasted_text, job_description):
@@ -53,6 +57,10 @@ def input_signature(uploaded_file, pasted_text, job_description):
     if uploaded_file is not None:
         file_part = (uploaded_file.name, hashlib.sha256(bytes(uploaded_file.getbuffer())).hexdigest())
     return (file_part, pasted_text or "", job_description or "")
+
+
+def clear_history():
+    storage.clear()
 
 
 def clear_all():
@@ -83,6 +91,9 @@ def analyze(uploaded_file, pasted_text, job_description):
             None,
         )
 
+    if state and result is not None and storage.enabled():
+        # only a summary (scores and skill names) is kept, never the resume text or quotes
+        _, st.session_state.history_note = storage.save(result, job_description, core.MODEL_NAME)
     st.session_state.analyzed_sig = signature if state else None
     st.session_state.state = state
     st.session_state.report = report
@@ -140,9 +151,49 @@ with right:
     if st.session_state.notice:
         st.info(st.session_state.notice)
     st.markdown(st.session_state.report)
+    if st.session_state.result is not None:
+        # Saved on the user's own computer by the browser: works online and offline, nothing is kept on the server.
+        download_report, download_json = st.columns(2)
+        download_report.download_button(
+            "Download report (.md)", data=st.session_state.report,
+            file_name="resume_fit_report.md", mime="text/markdown",
+        )
+        download_json.download_button(
+            "Download analysis (.json)", data=json.dumps(st.session_state.result, indent=2),
+            file_name="resume_fit_analysis.json", mime="application/json",
+        )
+    if st.session_state.history_note:
+        st.caption(st.session_state.history_note)
     with st.expander("Raw JSON output"):
         if st.session_state.result is not None:
             st.json(st.session_state.result)
+
+    with st.expander("Saved history (this computer)"):
+        if not storage.enabled():
+            st.caption(
+                "History is off. It keeps a summary (score and skill names, never the resume text) in "
+                "data/history.jsonl on the computer running this app. Switch it on by setting ENABLE_HISTORY=1 "
+                "in .env (do not use it on a public website). Use the Download buttons to keep a report."
+            )
+        else:
+            saved = storage.load()
+            if not saved:
+                st.caption("No saved analyses yet.")
+            else:
+                st.dataframe(
+                    [
+                        {
+                            "Saved (UTC)": e.get("saved_at", ""),
+                            "Job": e.get("job_title", ""),
+                            "Score": e.get("fit_score"),
+                            "Matched": len(e.get("matched", [])),
+                            "Missing": len(e.get("missing", [])),
+                        }
+                        for e in saved
+                    ],
+                    hide_index=True,
+                )
+            st.button("Clear history", on_click=clear_history)
 
 # ---------- career advisor chat ----------
 st.markdown("## Career Advisor Chat")

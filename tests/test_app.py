@@ -390,3 +390,67 @@ def test_ui07_unexpected_error_details_are_not_shown_on_the_page(monkeypatch):
     assert at.session_state["state"] is None
     page = all_markdown(at)
     assert "secret internal detail" not in page and "could not be completed" in page
+
+
+# =====================================================================================
+# UI08: stored data - downloads (always) and optional history (off by default)
+# =====================================================================================
+FULL_RESULT = {
+    "fit_score": 74, "score_breakdown": {"skills_coverage": 30},
+    "required_skills": ["Python"], "matched_skills": [{"skill": "Python", "evidence_type": "applied",
+                                                        "evidence": "Wrote Python scripts for Anita Rao's team."}],
+    "missing_skills": [], "preferred_skills": [], "suggestions": ["a", "b", "c"],
+}
+
+
+@pytest.fixture
+def stub_analysis(monkeypatch):
+    monkeypatch.setattr(core, "safe_analyze",
+                        lambda f, t, j: (STATE_A, "## Fit Score: 74/100 - Anita", FULL_RESULT))
+
+
+def test_ui08_download_buttons_appear_only_while_an_analysis_exists(stub_analysis):
+    at = new_app()
+    assert len(at.get("download_button")) == 0
+    at = analyze(at)
+    assert len(at.get("download_button")) == 2
+    labels = {b.proto.label for b in at.get("download_button")}
+    assert labels == {"Download report (.md)", "Download analysis (.json)"}
+    button(at, "Clear all").click().run()
+    assert len(at.get("download_button")) == 0
+
+
+def test_ui08b_history_is_off_by_default_and_writes_nothing(stub_analysis, tmp_path, monkeypatch):
+    path = tmp_path / "h" / "history.jsonl"
+    monkeypatch.setenv("HISTORY_FILE", str(path))
+    monkeypatch.delenv("ENABLE_HISTORY", raising=False)
+    at = analyze(new_app())
+    assert not at.exception and not path.exists()
+    assert any("History is off" in c.value for c in at.caption)
+
+
+def test_ui08c_history_when_switched_on_keeps_a_summary_only(stub_analysis, tmp_path, monkeypatch):
+    path = tmp_path / "h" / "history.jsonl"
+    monkeypatch.setenv("HISTORY_FILE", str(path))
+    monkeypatch.setenv("ENABLE_HISTORY", "1")
+    at = analyze(new_app())
+    assert not at.exception
+    raw = path.read_text(encoding="utf-8")
+    assert '"fit_score": 74' in raw and "Anita" not in raw and "Wrote Python scripts" not in raw
+    assert any("Summary saved" in c.value for c in at.caption)
+
+    button(at, "Clear all").click().run()          # clearing the page does not delete saved history
+    assert path.exists()
+    button(at, "Clear history").click().run()      # but the dedicated button does
+    assert not path.exists()
+
+
+def test_ui08d_a_history_write_failure_does_not_break_the_analysis(stub_analysis, tmp_path, monkeypatch):
+    blocker = tmp_path / "blocked"
+    blocker.write_text("file")
+    monkeypatch.setenv("HISTORY_FILE", str(blocker / "history.jsonl"))
+    monkeypatch.setenv("ENABLE_HISTORY", "1")
+    at = analyze(new_app())
+    assert not at.exception
+    assert at.session_state["state"] == STATE_A     # the analysis is still shown
+    assert any("Could not save" in c.value for c in at.caption)

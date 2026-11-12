@@ -22,6 +22,7 @@ claims against the resume text in code** and calculates the skills score itself.
 | Gap analysis | Missing mandatory skills, plus preferred ("nice to have") skills shown separately |
 | Improvement suggestions | Exactly three suggestions that must not tell the candidate to claim skills they lack |
 | Career-advisor chat | Streaming follow-up chat grounded in the resume, the job description and the verified analysis |
+| Keep your results | **Download** buttons save the report (.md) and the analysis (.json) on your own computer. Optional local history keeps a score-and-skills summary (never the resume text) |
 | Safety and usability | Prompt-injection handling, clear error messages, a **Clear all** button. Editing the resume, upload or job description clears the old result and chat |
 
 ## Course concepts used
@@ -36,22 +37,26 @@ claims against the resume text in code** and calculates the skills score itself.
 ## Project structure
 ```
 app.py                 Streamlit interface only (inputs, state, invalidation, chat display)
-core.py                Prompts, document reading, Groq calls, validation, scoring, report, chat
+core.py                Prompts, document reading, Groq calls (with rate-limit waiting), validation, scoring, report, chat
+storage.py             Optional local history of analysis summaries (off by default)
 live_tests.py          Real-model test runner (needs a Groq key), writes live_results.md/json
 requirements.txt       Runtime dependencies, pinned to tested versions
 requirements-dev.txt   Adds pytest
 .env.example           Template for your API key
 pytest.ini             Test settings
 samples/               Synthetic resumes and job descriptions (no real people)
-tests/test_core.py     116 offline tests of core.py (model mocked)
-tests/test_app.py      23 interface tests with Streamlit AppTest (model mocked)
+tests/test_core.py     127 offline tests of core.py (model mocked)
+tests/test_app.py      27 interface tests with Streamlit AppTest (model mocked)
+tests/test_storage.py  14 tests of the history storage
+tests/test_live_runner.py  3 tests that rate-limit problems are never recorded as model failures
 docs/sample_output.md  Example report (stubbed model reply, see below)
 TESTING.md             Test plan, offline results, live-test table
 ```
 `core.py` is long. If the project grows, split it into prompts, validation/scoring, and API/document reading.
 
 ## Setup
-1. Install **Python 3.11**. All tests were run with Python 3.11+; other versions have not been tested.
+1. Install **Python 3.11 or 3.12** (3.11 is the minimum, because Streamlit 1.67 requires it). The offline tests were run on
+   Python 3.11.15 and 3.12.3; the author runs the app on 3.11.9. Other versions have not been tested.
 2. Create a free Groq API key at https://console.groq.com/keys
 3. Get the project and open a terminal in the project folder (the one that contains `app.py`):
    - If you received a ZIP, unzip it.
@@ -80,19 +85,38 @@ Supported files: PDF and TXT only (5 MB max). Scanned or image PDFs are not supp
 |---|---|---|
 | `GROQ_API_KEY` | yes | none |
 | `MODEL_NAME` | no | `openai/gpt-oss-120b` |
+| `ENABLE_HISTORY` | no | off. Set to `1` to keep a local history (see below) |
+| `HISTORY_FILE` | no | `data/history.jsonl` |
 
 Settings are read from `.env` locally or from Streamlit secrets when deployed. Never commit `.env`.
+
+## Online, offline and stored data
+| Situation | What works |
+|---|---|
+| **Online, run on your computer** (`streamlit run app.py`) | Everything: analysis, chat, downloads, optional history |
+| **Offline** (no internet) | The app opens and shows a clear message ("Cannot reach Groq. Check your internet connection"); nothing crashes and no old data is left on screen. Analysis and chat need internet because the AI model runs on Groq's servers. Downloaded reports, saved history and `pytest` all work offline |
+| **Online, deployed** (Streamlit Community Cloud) | Everything except history, which should stay off there |
+
+**Where data is stored**
+- **Download buttons** (report `.md`, analysis `.json`): the browser saves the file on *your* computer. Nothing is kept on the server. This works everywhere and is the recommended way to keep a result.
+- **Optional history** (`ENABLE_HISTORY=1` in `.env`, local use only): after each analysis one line is appended to `data/history.jsonl` with the date, the first line of the job description, the scores, and skill **names** with how each was matched. It never stores the resume text, the evidence quotes or the suggestions. The "Saved history" panel lists it, and **Clear history** deletes the file. The file is in `.gitignore`.
+- **Why history is off by default:** a resume is personal data. On a public deployment the server's files are shared by all visitors and are lost on restart, so keeping history there would be both a privacy risk and unreliable.
+- Nothing else is stored: the pasted text and uploads live only in the browser session and are dropped when you click **Clear all** or edit the inputs.
 
 ## Run the tests
 ```
 pip install -r requirements-dev.txt
 pytest                                    # offline: Groq is mocked, no key or network needed
-python live_tests.py --runs 3 --record    # real model: needs GROQ_API_KEY and internet access to Groq
+python live_tests.py --runs 3 --record --pause 20    # real model: needs GROQ_API_KEY and internet access to Groq
 ```
+**Free Groq plans allow only about 8,000 tokens per minute** and one analysis needs 2,000 to 3,000 (the long-document case about 6,700), so
+the full live run takes roughly 15 to 25 minutes. The app and the runner wait the time Groq asks for and retry. If a case still cannot
+run because of the rate limit or the network, it is recorded as **NOT RUN** and never as FAIL; the runner prints the command to run those
+cases again. Start with `--runs 1` if you want a quick first pass.
 The live command writes `live_results.md` (full outputs and suggestions) and fills the live-test table in `TESTING.md`
 from the real results. It first makes one small test call, and if the key or network is wrong it stops without recording anything.
 
-**Observed results.** Offline: **139 passed** (116 core + 23 interface), last run 12 Nov 2026 on Python 3.12.3. These verify the
+**Observed results.** Offline: **171 passed** (127 core, 27 interface, 14 storage, 3 live-runner), last run 12 Nov 2026 on Python 3.11.15 and 3.12.3 (same result on both). The offline app behaviour with no internet was also checked without any mocks. These verify the
 application's behaviour under controlled model replies; they do **not** establish the real model's accuracy or consistency.
 Live: **not yet recorded.** It needs a Groq key and network access; see `TESTING.md`.
 
@@ -217,6 +241,8 @@ More sample inputs:
 ## Reliability, timeouts and retries
 - Each Groq request times out after 60 s (`API_TIMEOUT_SECONDS`); the Groq client's own retries are off.
 - Transient failures are retried up to 3 times with 2 s then 4 s pauses (`call_groq`). A wrong API key is not retried.
+- **Rate limits (HTTP 429):** the app waits as long as Groq asks (plus 1 s) and retries up to 4 times without using up the normal attempts. A wait longer than 65 s (for example a daily limit) is reported with the time instead of being waited for. The same applies to the streaming chat if the limit hits before any text arrives.
+- **No internet:** reported as "Cannot reach Groq. Check your internet connection and try again."
 - A reply that fails validation triggers up to 3 model calls in total (`MAX_ANALYSIS_ATTEMPTS`).
 - The page shows short messages. Full exceptions go to the application log (logger `resume_screener`).
 
@@ -224,7 +250,7 @@ More sample inputs:
 1. Push `app.py`, `core.py`, `requirements.txt` and `.gitignore` to a GitHub repository. Do **not** push `.env`.
 2. Go to https://share.streamlit.io, sign in with GitHub and click **Create app**.
 3. Select the repository, branch `main` and main file `app.py`.
-4. Open **Advanced settings -> Secrets** and add: `GROQ_API_KEY = "gsk_your_key_here"`
+4. Open **Advanced settings -> Secrets** and add: `GROQ_API_KEY = "gsk_your_key_here"`. Do not set `ENABLE_HISTORY` on a public deployment; visitors keep results with the Download buttons.
 5. Click **Deploy**.
 6. Optional: once deployed, add a line `Live demo: <your deployed address>` directly under the title of this file.
 
@@ -242,6 +268,8 @@ More sample inputs:
   and indirectly phrased negations. If the job description is ambiguous the skill is treated as mandatory.
 - **Scoring variability:** the 60 judgement points vary between runs and models. Compare repeated runs (`--runs 3`).
 - **Textual evidence only:** the app cannot prove the candidate is competent.
-- **Free Groq limits apply** (requests and tokens per minute and per day). On a public deployment all visitors share them.
+- **Free Groq limits apply** (about 8,000 tokens per minute on the plan used for testing, plus daily limits). That is roughly three analyses per minute, and on a public deployment all visitors share it, so a busy moment makes the app wait. A paid Groq tier removes the limit.
+- **Needs internet for analysis and chat** (hosted model). There is no local-model fallback.
+- **No accounts or database:** results are kept only by downloading them or, locally, in the optional history summary.
 - **Privacy:** resume and job text are sent to Groq. Use synthetic or consented data.
 - Editing the resume, upload or job description clears the previous result and chat on purpose.

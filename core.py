@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import time
+from typing import Any
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,6 +29,8 @@ API_TIMEOUT_SECONDS = 60  # per request; the Groq client's own retries are switc
 API_ATTEMPTS = 3          # app-level attempts per call, waiting 2 s then 4 s between them
 MAX_ANALYSIS_ATTEMPTS = 3  # model calls when the analysis fails validation (corrected reply requested)
 SUPPORTED_SUFFIXES = (".pdf", ".txt")
+RATE_LIMIT_RETRIES = 4     # extra tries after Groq says "rate limit"; each waits as long as Groq asks
+RATE_LIMIT_MAX_WAIT = 65   # seconds; a longer wait (e.g. a daily limit) is reported instead of waited for
 
 # Four score components. The total is always added up in Python.
 SCORE_LIMITS = {
@@ -343,8 +346,10 @@ def _strip_think(text):
     return re.sub(r"<think>.*$", "", text, flags=re.DOTALL).strip()
 
 
-def _build_kwargs(messages, max_tokens, temperature, json_mode):
-    kwargs = dict(
+def _build_kwargs(messages, max_tokens, temperature, json_mode) -> dict[str, Any]:
+    """Settings for one Groq request. Typed as dict[str, Any] so editors (Pylance) do not try to
+    match every value against one Groq parameter type."""
+    kwargs: dict[str, Any] = dict(
         model=MODEL_NAME,
         messages=messages,
         max_tokens=max_tokens,
@@ -359,24 +364,73 @@ def _build_kwargs(messages, max_tokens, temperature, json_mode):
     return kwargs
 
 
+_RETRY_HINT = re.compile(r"try again in\s+((?:\d+(?:\.\d+)?(?:ms|m|s))+)", re.I)
+
+
+def _retry_after_seconds(error):
+    """Seconds Groq asks us to wait ('Please try again in 11.25s' / '52.5ms' / '1m2.5s'), or None."""
+    match = _RETRY_HINT.search(str(error))
+    if not match:
+        return None
+    total = 0.0
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)(ms|m|s)", match.group(1), flags=re.I):
+        total += float(number) * {"ms": 0.001, "s": 1.0, "m": 60.0}[unit.lower()]
+    return total
+
+
+def _is_too_large(error):
+    """HTTP 413: the request itself is bigger than the model's per-minute input limit.
+    Waiting never helps (the next request is just as big), so it is NOT retried."""
+    text = str(error).lower()
+    return getattr(error, "status_code", None) == 413 or "request too large" in text or "error code: 413" in text
+
+
+def _is_rate_limit(error):
+    text = str(error).lower()
+    if _is_too_large(error):
+        return False
+    return type(error).__name__ == "RateLimitError" or "rate limit" in text or "rate_limit_exceeded" in text
+
+
+def _rate_limit_wait(error, waits_so_far):
+    """How long to wait before retrying a rate-limited call, or None if it is not worth waiting."""
+    hint = _retry_after_seconds(error)
+    wait = hint + 1 if hint is not None else 10 * (waits_so_far + 1)
+    return wait if wait <= RATE_LIMIT_MAX_WAIT else None
+
+
 def _friendly_error(error):
     name, message = type(error).__name__, str(error)
     log.warning("Groq call failed: %s: %s", name, message)  # details stay in the log
     if name == "AuthenticationError" or "invalid_api_key" in message:
         return "Invalid GROQ_API_KEY. Check your .env file or secret."
-    if name == "RateLimitError" or "rate limit" in message.lower():
-        return "Groq rate limit reached. Wait a minute and try again, or choose a lighter model."
+    if _is_too_large(error):
+        return ("The request is too large for this model's per-minute input limit. "
+                "Set MODEL_NAME=openai/gpt-oss-120b in .env, or use a shorter resume / job description.")
+    if _is_rate_limit(error):
+        hint = _retry_after_seconds(error)
+        when = f" Try again in about {math.ceil(hint)} seconds." if hint and hint >= 1 else ""
+        return "Groq rate limit reached." + when + " Wait a minute and try again, or choose a lighter model."
     if name in ("APITimeoutError", "Timeout", "TimeoutError") or "timed out" in message.lower():
         return f"The Groq service did not answer within {API_TIMEOUT_SECONDS} seconds. Please try again."
+    if name in ("APIConnectionError", "ConnectError", "ConnectionError") or "connection error" in message.lower():
+        return "Cannot reach Groq. Check your internet connection and try again."
+    if "empty response" in message.lower():
+        return "The model returned an empty answer. Please try again."
     return "The Groq service is unavailable. Please try again in a moment."
 
 
 def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attempts=API_ATTEMPTS):
-    """Call Groq with retries (timeout API_TIMEOUT_SECONDS each, 2 s then 4 s pause between
-    attempts for transient errors; no retry for a bad key). Raises RuntimeError."""
+    """Call Groq with retries. Timeout API_TIMEOUT_SECONDS per request. Transient errors are retried
+    after 2 s, then 4 s. A rate limit (free plans allow few tokens per minute) is retried after the
+    wait Groq asks for, up to RATE_LIMIT_RETRIES times, and does not use up the normal attempts.
+    A wrong API key is never retried. Raises RuntimeError with a short message."""
     last_error = None
+    rate_waits = 0
+    attempt = 0
 
-    for attempt in range(1, attempts + 1):
+    while attempt < attempts:
+        attempt += 1
         try:
             response = get_client().chat.completions.create(
                 **_build_kwargs(messages, max_tokens, temperature, json_mode)
@@ -402,6 +456,15 @@ def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attem
                 ) from error
             if isinstance(error, RuntimeError):
                 raise
+            if _is_rate_limit(error):
+                wait = _rate_limit_wait(error, rate_waits)
+                if wait is None or rate_waits >= RATE_LIMIT_RETRIES:
+                    raise RuntimeError(_friendly_error(error)) from error
+                rate_waits += 1
+                log.info("Rate limited; waiting %.1f s (%d/%d)", wait, rate_waits, RATE_LIMIT_RETRIES)
+                time.sleep(wait)
+                attempt -= 1  # waiting for the limit is not a failed attempt
+                continue
             if attempt < attempts:
                 time.sleep(2 * attempt)
 
@@ -409,25 +472,36 @@ def call_groq(messages, json_mode=False, max_tokens=2000, temperature=0.2, attem
 
 
 def call_groq_stream(messages, max_tokens=1500, temperature=0.4):
-    """Generator yielding the growing reply text (streaming)."""
-    try:
-        stream = get_client().chat.completions.create(
-            **_build_kwargs(messages, max_tokens, temperature, False), stream=True
-        )
+    """Generator yielding the growing reply text (streaming). A rate limit that hits before any
+    text arrived is waited out and retried, like in call_groq."""
+    rate_waits = 0
+    while True:
         text = ""
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content if chunk.choices else None
-            if delta:
-                text += delta
-                visible = _strip_think(text)
-                if visible:
-                    yield visible
-        if not _strip_think(text):
-            raise ValueError("The model returned an empty response.")
-    except RuntimeError:
-        raise
-    except Exception as error:
-        raise RuntimeError(_friendly_error(error)) from error
+        try:
+            stream = get_client().chat.completions.create(
+                **_build_kwargs(messages, max_tokens, temperature, False), stream=True
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    text += delta
+                    visible = _strip_think(text)
+                    if visible:
+                        yield visible
+            if not _strip_think(text):
+                raise ValueError("The model returned an empty response.")
+            return
+        except RuntimeError:
+            raise
+        except Exception as error:
+            if _is_rate_limit(error) and not text and rate_waits < RATE_LIMIT_RETRIES:
+                wait = _rate_limit_wait(error, rate_waits)
+                if wait is not None:
+                    rate_waits += 1
+                    log.info("Rate limited; waiting %.1f s (%d/%d)", wait, rate_waits, RATE_LIMIT_RETRIES)
+                    time.sleep(wait)
+                    continue
+            raise RuntimeError(_friendly_error(error)) from error
 
 
 # ============================================================
@@ -596,7 +670,7 @@ _JD_HEADING = {
 _EXCLUDED_CUE = re.compile(
     r"\b(?:not|isn't|aren't|never)\s+(?:be\s+)?(?:required|needed|necessary|expected|essential|mandatory|a requirement)\b"
     r"|\bno\s+(?:need|requirement)\b|\b(?:don't|do not|doesn't|does not)\s+(?:need|require)\b"
-    r"|\bunnecessary\b", re.I)
+    r"|\bunnecessary\b|\b(?:is|are)\s+not\W*$|\b(?:isn't|aren't)\W*$", re.I)  # last two: "... but X is not."
 _PREFERRED_CUE = re.compile(
     r"\b(?:nice[- ]to[- ]have|optional(?:ly)?|preferred|desirable|good to have|bonus|"
     r"an? (?:plus|advantage)|is (?:a )?plus|beneficial|ideally|would be (?:a )?(?:plus|nice|great|helpful|an advantage))\b",
@@ -604,46 +678,107 @@ _PREFERRED_CUE = re.compile(
 _CONNECTOR = re.compile(r"\s*(?:,\s*)?(?:(?:and/)?or|/)\s*", re.I)
 
 
+_MANDATORY_CUE = re.compile(r"\b(?:required|must[- ]haves?|mandatory|essential|must know|needed)\b", re.I)
+_CHUNK_BREAK = re.compile(r",|;|\(|\)|\s+and\s+|\s+or\s+", re.I)
+_CUE_FILLER = {"is", "are", "be", "a", "an", "the", "also", "very", "strongly", "highly", "as", "this",
+               "that", "it", "all", "both", "any", "of", "these", "those", "considered", "seen", "to"}
+_PLURAL = re.compile(r"\b(?:are|all|both|these|those)\b", re.I)
+
+
+def _cue_category(chunk):
+    """The requirement wording inside one clause: excluded > preferred > mandatory > None."""
+    if _EXCLUDED_CUE.search(chunk):
+        return "excluded"
+    if _PREFERRED_CUE.search(chunk):
+        return "preferred"
+    if _MANDATORY_CUE.search(chunk):
+        return "mandatory"
+    return None
+
+
+def _is_bare_cue(chunk):
+    """True for a clause that is only a cue, e.g. '(optional)' or 'is a plus': it describes the
+    clause BEFORE it. 'Kubernetes optional' is not bare: it names its own subject."""
+    words = re.findall(r"[a-z'/+#.-]+", _EXCLUDED_CUE.sub(" ", _PREFERRED_CUE.sub(" ", _MANDATORY_CUE.sub(" ", chunk.lower()))))
+    return all(w in _CUE_FILLER or w in ("not", "no", "need", "isn't", "aren't") for w in words)
+
+
+class JDUnit:
+    """One sentence of the job description with a requirement category for each clause in it."""
+
+    def __init__(self, sentence, default):
+        self.sentence, self.default = sentence, default
+        bounds, start = [], 0
+        for match in _CHUNK_BREAK.finditer(sentence):
+            bounds.append((start, match.start()))
+            start = match.end()
+        bounds.append((start, len(sentence)))
+        cats: list[str | None] = [None] * len(bounds)
+        for i, (lo, hi) in enumerate(bounds):
+            chunk = sentence[lo:hi]
+            cue = _cue_category(chunk)
+            if cue is None:
+                continue
+            cats[i] = cue
+            targets = [i]
+            if _is_bare_cue(chunk):          # "(optional)", "is a plus": about the clause before
+                targets = [i - 1] if i > 0 else []
+                cats[i] = None if i > 0 else cats[i]
+            if _PLURAL.search(chunk):        # "Docker, Kubernetes and Terraform are optional"
+                j = (targets[0] if targets else i) - 1
+                while j >= 0 and cats[j] is None:
+                    targets.append(j)
+                    j -= 1
+            for t in targets:
+                if 0 <= t < len(cats) and (cats[t] is None or t == i or cue == "excluded"):
+                    cats[t] = cue
+        self.chunks = [(lo, hi, cats[i] or default) for i, (lo, hi) in enumerate(bounds)]
+
+    def category_at(self, position):
+        for lo, hi, category in self.chunks:
+            if lo <= position <= hi:
+                return category
+        return self.default
+
+
 def parse_jd_units(job_text):
-    """[(sentence, category)] with category mandatory / preferred / excluded.
-    Uses headings ('Required:', 'Nice to have:'), inline cues ('is optional', 'not required')
-    and defaults to mandatory. A heuristic: it reads the wording, it does not understand it."""
+    """[JDUnit]: each sentence with a mandatory / preferred / excluded category PER CLAUSE.
+    Uses headings ('Required:', 'Nice to have:'), the wording next to each skill ('Python is
+    optional', 'Kubernetes is not required', 'Docker (preferred)') and defaults to mandatory.
+    A heuristic: it reads the wording, it does not understand it."""
     units, section = [], "mandatory"
     for raw in job_text.splitlines():
         line = raw.strip().lstrip("-*\u2022\u25cf\u25aa \t").strip()
         if not line:
             continue
-        for name, (heading_only, _) in _JD_HEADING.items():
-            if heading_only.match(line):
-                section = name
-                break
-        else:
-            if line.endswith(":") and len(line.split()) <= 5:
-                section = "mandatory"  # some other heading, e.g. 'Responsibilities:'
-                continue
-            for sentence in re.split(r"(?<=[.;!?])\s+|\s+(?:but|while|whereas)\s+", line):
-                sentence, category = sentence.strip(), section
-                if not sentence:
-                    continue
-                for name, (_, inline) in _JD_HEADING.items():
-                    match = inline.match(sentence)
-                    if match:
-                        category, sentence = name, match.group(1)
-                        break
-                if _EXCLUDED_CUE.search(sentence):
-                    category = "excluded"
-                elif _PREFERRED_CUE.search(sentence):
-                    category = "preferred"
-                units.append((sentence, category))
+        if any(heading_only.match(line) for heading_only, _ in _JD_HEADING.values()):
+            section = next(n for n, (h, _) in _JD_HEADING.items() if h.match(line))
             continue
-        continue  # heading-only line
+        if line.endswith(":") and len(line.split()) <= 5:
+            section = "mandatory"  # some other heading, e.g. 'Responsibilities:'
+            continue
+        for sentence in re.split(r"(?<=[.;!?])\s+|\s+(?:but|while|whereas)\s+", line):
+            sentence, category = sentence.strip(), section
+            if not sentence:
+                continue
+            for name, (_, inline) in _JD_HEADING.items():
+                match = inline.match(sentence)
+                if match:
+                    category, sentence = name, match.group(1)
+                    break
+            units.append(JDUnit(sentence, category))
     return units
 
 
 def jd_category(skill, units):
     """mandatory / preferred / excluded for a skill, or None if the job description never names it.
-    If sentences disagree: an explicit 'not required' wins, then mandatory, then preferred."""
-    cats = {category for sentence, category in units if skill_in_text(skill, sentence)}
+    If clauses disagree: an explicit 'not required' wins, then mandatory, then preferred."""
+    cats = set()
+    for unit in units:
+        if not skill_in_text(skill, unit.sentence):
+            continue
+        spans = skill_spans(skill, unit.sentence)
+        cats.update(unit.category_at(start) for start, _ in spans) if spans else cats.add(unit.default)
     if not cats:
         return None
     for category in ("excluded", "mandatory", "preferred"):
@@ -655,14 +790,11 @@ def jd_category(skill, units):
 def alternative_groups(units):
     """Sets of canonical skill keys the job description offers as alternatives ('Tableau or Power BI')."""
     groups = []
-    for sentence, category in units:
-        if category != "mandatory":
-            continue
-        found = []
-        for skill in KNOWN_SKILLS:
-            for start, end in skill_spans(skill, sentence):
-                found.append((start, end, canon_key(skill)))
-        found.sort()
+    for unit in units:
+        sentence = unit.sentence
+        found = sorted((start, end, canon_key(skill))
+                       for skill in KNOWN_SKILLS for start, end in skill_spans(skill, sentence)
+                       if unit.category_at(start) == "mandatory")
         chain = [found[0]] if found else []
         for previous, current in zip(found, found[1:]):
             if previous[2] != current[2] and _CONNECTOR.fullmatch(sentence[previous[1]:current[0]]):

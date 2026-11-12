@@ -1,18 +1,16 @@
-# Environment Variables
+# Secrets
 .env
 
-# Virtual Environment
+# Virtual environments
 Bot/
+venv/
+.venv/
 
-# Python Cache
+# Python cache
 __pycache__/
 *.pyc
-
-# Pytest
 .pytest_cache/
 
-# Generated Files
+# Project output and data
 live_results.*
-
-# VS Code
-.vscode/
+data/

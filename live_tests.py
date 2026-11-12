@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,10 @@ import core
 
 ROOT = Path(__file__).resolve().parent
 S = ROOT / "samples"
-TRACE: dict[str, int] = {"calls": 0}
+TRACE: dict[str, Any] = {"calls": 0, "infra": None}
+INFRA = "infra"  # verdict for "could not run": rate limit or network problem, NOT a model failure
+VERDICT = {True: "PASS", False: "FAIL", None: "MANUAL", INFRA: "NOT RUN (rate limit / network)"}
+_INFRA_WORDS = ("rate limit reached", "cannot reach groq", "did not answer within", "service is unavailable", "too large for this model")
 _real_call = core.call_groq
 
 
@@ -32,6 +36,28 @@ def _counting_call(*args, **kwargs):
 
 
 core.call_groq = _counting_call
+
+# Remember when a case was stopped by Groq's rate limit or the network. That says nothing about
+# the model, so such a case must never be recorded as a FAIL.
+_real_friendly_error = core._friendly_error
+
+
+def _recording_friendly_error(error):
+    message = _real_friendly_error(error)
+    if any(word in message.lower() for word in _INFRA_WORDS):
+        TRACE["infra"] = message
+    return message
+
+
+core._friendly_error = _recording_friendly_error
+
+
+def classify(passed: Any, infra_message: str | None) -> Any:
+    """PASS/FAIL/MANUAL as the case decided, except: a case that did not pass AND was stopped by
+    a rate limit or network problem is NOT RUN. (A case that passed after waiting stays PASS.)"""
+    if passed is not True and infra_message:
+        return INFRA
+    return passed
 
 
 def read(name: str) -> str:
@@ -213,10 +239,62 @@ CASES = {"L1": l1, "L2": l2, "L3": l3, "L3b": l3b, "L4": l4, "L5": l5, "L6": l6,
 OFFLINE = {"L5"}
 
 
+def record_into_testing_md(results, runs, stamp):
+    """Fill the live-test table in TESTING.md from the REAL results of this run (nothing is typed by hand).
+    Only the 'Suggestions grounded?' column is left for a human to read and fill."""
+    path = ROOT / "TESTING.md"
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    for r in results:
+        case_id, _, run_part = r["case"].partition(" (run ")
+        run = int(run_part.rstrip(")")) if run_part else 1
+        verdict = VERDICT[r["pass"]]
+        score = r["summary"].get("fit_score") if isinstance(r["summary"], dict) else None
+        cell = verdict + (f" (score {score})" if score is not None else "")
+        for i, line in enumerate(lines):
+            if line.startswith(f"| {case_id} |"):
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                cells += [""] * (7 - len(cells))
+                cells[2 + run] = cell  # Run 1 -> column 3, Run 2 -> 4, Run 3 -> 5
+                lines[i] = "| " + " | ".join(cells) + " |"
+    text = "\n".join(lines) + "\n"
+    status = (f"<!-- LIVE-STATUS-START -->\n**Status: recorded {stamp} with model `{core.MODEL_NAME}`, "
+              f"{runs} run(s) per model case.** Filled by `python live_tests.py --record`. Read the suggestions in "
+              f"`live_results.md` and complete the last column by hand.\n<!-- LIVE-STATUS-END -->")
+    start, end = text.find("<!-- LIVE-STATUS-START -->"), text.find("<!-- LIVE-STATUS-END -->")
+    if start != -1 and end != -1:
+        text = text[:start] + status + text[end + len("<!-- LIVE-STATUS-END -->"):]
+    path.write_text(text, encoding="utf-8")
+
+
+def preflight():
+    """One tiny real request, only to learn that the key and the network work, so a missing
+    network or key is reported as such and is never recorded as a model FAIL. The reply text
+    is NOT checked: reasoning models can spend a small token budget thinking and return no
+    visible text, which still proves that Groq answered."""
+    try:
+        core.get_client().chat.completions.create(
+            **core._build_kwargs([{"role": "user", "content": "Reply with the single word OK."}], 300, 0.0, False)
+        )
+    except RuntimeError as error:  # e.g. GROQ_API_KEY missing
+        sys.exit(f"Preflight failed, nothing was run or recorded: {error}")
+    except Exception as error:
+        sys.exit(f"Preflight failed, nothing was run or recorded: {core._friendly_error(error)}")
+
+
+def save_outputs(results, md):
+    """Write live_results.json / .md. Called after EVERY run so a Ctrl+C or crash loses nothing."""
+    (ROOT / "live_results.json").write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+    (ROOT / "live_results.md").write_text("\n".join(md), encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--record", action="store_true", help="write the results into the TESTING.md table")
     parser.add_argument("cases", nargs="*", help="case ids, e.g. L1 L3b (default: all)")
     parser.add_argument("--runs", type=int, default=1, help="repeat model cases N times")
+    parser.add_argument("--pause", type=float, default=0.0,
+                        help="seconds to wait between model calls (free plans: 8,000 tokens/minute; try 20)")
     args = parser.parse_args()
     chosen = args.cases or list(CASES)
     unknown = [c for c in chosen if c not in CASES]
@@ -227,22 +305,33 @@ def main():
             core.get_client()
         except RuntimeError as error:
             sys.exit(str(error))
+        preflight()
     stamp = datetime.datetime.now().isoformat(timespec="seconds")
     results, md = [], [f"# Live test results\n\nModel: `{core.MODEL_NAME}`  \nRun at: {stamp}\n"]
-    for case_id in chosen:
+    try:
+      for case_id in chosen:
         for run in range(1, (1 if case_id in OFFLINE else args.runs) + 1):
             label = case_id if args.runs == 1 else f"{case_id} (run {run})"
             print(f"running {label} ...", flush=True)
+            TRACE["infra"] = None
             try:
                 summary, passed, rule, text = CASES[case_id]()
             except Exception as error:  # record, do not hide
                 summary, passed, rule, text = {"exception": repr(error)}, False, "must not raise", ""
-            verdict = {True: "PASS", False: "FAIL", None: "MANUAL"}[passed]
+            passed = classify(passed, TRACE["infra"])
+            if passed == INFRA:
+                summary = {"not_run_reason": TRACE["infra"]}
+            verdict = VERDICT[passed]
             print(f"  {verdict}")
             results.append({"case": label, "pass": passed, "rule": rule, "summary": summary})
             md.append(f"## {label}: {verdict}\n\n**Rule:** {rule}\n\n```json\n"
                       f"{json.dumps(summary, indent=2, default=str)}\n```\n\n<details><summary>Full output</summary>\n\n"
                       f"{text}\n\n</details>\n")
+            save_outputs(results, md)  # saved after every run
+            if args.pause and case_id not in OFFLINE:
+                time.sleep(args.pause)  # wait AFTER saving, so Ctrl+C here loses nothing
+    except KeyboardInterrupt:
+        print("\nStopped with Ctrl+C. Results so far were saved; they are written below.")
 
     # score stability: the model's output varies, so repeated runs show how much
     stability = {}
@@ -257,12 +346,22 @@ def main():
         md.append("\n".join(lines) + "\n")
         print("\nScore stability:", {k: (min(v), max(v)) for k, v in stability.items()})
 
-    (ROOT / "live_results.json").write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
-    (ROOT / "live_results.md").write_text("\n".join(md), encoding="utf-8")
+    save_outputs(results, md)
     print("\n| Case | Result |\n|---|---|")
     for r in results:
-        print(f"| {r['case']} | {({True: 'PASS', False: 'FAIL', None: 'MANUAL'})[r['pass']]} |")
-    print("\nWrote live_results.md and live_results.json - paste the outcome into TESTING.md section B.")
+        print(f"| {r['case']} | {VERDICT[r['pass']]} |")
+    not_run = sorted({r["case"].split(" (")[0] for r in results if r["pass"] == INFRA})
+    if not_run:
+        print(f"\n{len([r for r in results if r['pass'] == INFRA])} run(s) were NOT RUN because of Groq's rate limit or "
+              "the network. That is not a model result and is not counted as FAIL.\n"
+              f"Run these again (wait a minute first):  python live_tests.py {' '.join(not_run)} "
+              f"--runs {args.runs} --pause 20{' --record' if args.record else ''}")
+    print("\nWrote live_results.md and live_results.json.")
+    if args.record:
+        record_into_testing_md(results, args.runs, stamp)
+        print("Updated the live-test table in TESTING.md. Now fill the 'Suggestions grounded?' column by hand.")
+    else:
+        print("Run again with --record to fill the TESTING.md table from these results.")
 
 
 if __name__ == "__main__":

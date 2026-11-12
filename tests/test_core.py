@@ -238,7 +238,7 @@ def test_tc09_api_outage_gives_clear_error_and_clears_state(monkeypatch):
     monkeypatch.setattr(core, "get_client", lambda: _fake_client(boom))
     state, report, result = core.safe_analyze(None, RESUME, JD)
     assert state is None and result is None
-    assert "unavailable" in report.lower()
+    assert "cannot reach groq" in report.lower() and "internet connection" in report.lower()
 
 
 def test_tc09b_invalid_key_is_not_retried(monkeypatch):
@@ -912,3 +912,157 @@ def test_tc24b_categories_sample_job_description():
     assert result["missing_skills"] == []
     assert result["score_breakdown"]["skills_coverage"] == 40
     assert [p["skill"] for p in result["preferred_skills"]] == ["Python"]
+
+
+# ---------------- mixed requirement wording inside ONE sentence (review round 3) ----------------
+MIXED = [
+    ("SQL is required, Python optional.", {"SQL": "mandatory", "Python": "preferred"}),
+    ("Python and SQL required, Kubernetes optional.",
+     {"Python": "mandatory", "SQL": "mandatory", "Kubernetes": "preferred"}),
+    ("Required: SQL, Python (optional).", {"SQL": "mandatory", "Python": "preferred"}),
+    ("Docker, Kubernetes and Terraform are optional.",
+     {"Docker": "preferred", "Kubernetes": "preferred", "Terraform": "preferred"}),
+    ("Experience with Docker (preferred) and Kubernetes (required).",
+     {"Docker": "preferred", "Kubernetes": "mandatory"}),
+    ("SQL is essential, Kubernetes is not required and Python is a plus.",
+     {"SQL": "mandatory", "Kubernetes": "excluded", "Python": "preferred"}),
+    ("Nice to have: Docker, Kubernetes (required).", {"Docker": "preferred", "Kubernetes": "mandatory"}),
+    ("SQL required; Docker, Terraform both optional.",
+     {"SQL": "mandatory", "Docker": "preferred", "Terraform": "preferred"}),
+    ("Python is optional and SQL is required.", {"Python": "preferred", "SQL": "mandatory"}),
+    ("SQL, Python, Tableau.", {"SQL": "mandatory", "Python": "mandatory", "Tableau": "mandatory"}),
+    ("Python is required but Kubernetes is not.", {"Python": "mandatory", "Kubernetes": "excluded"}),
+    ("Required: CI/CD and A/B testing, Docker is a plus.",
+     {"CI/CD": "mandatory", "A/B testing": "mandatory", "Docker": "preferred"}),
+    ("Tableau or Power BI required, Excel optional.",
+     {"Tableau": "mandatory", "Power BI": "mandatory", "Excel": "preferred"}),
+    ("Python (required), SQL (optional), Git (not required).",
+     {"Python": "mandatory", "SQL": "preferred", "Git": "excluded"}),
+]
+
+
+@pytest.mark.parametrize("jd,expected", MIXED)
+def test_tc25_each_clause_gets_its_own_requirement_category(jd, expected):
+    units = core.parse_jd_units("Role.\n" + jd)
+    assert {skill: core.jd_category(skill, units) for skill in expected} == expected
+
+
+def test_tc25b_alternatives_only_group_when_the_alternatives_are_mandatory():
+    mandatory = core.parse_jd_units("Tableau or Power BI required, Excel optional.")
+    assert core.alternative_groups(mandatory) == [{"tableau", "power bi"}]
+    assert core.alternative_groups(core.parse_jd_units("Nice to have: Tableau or Power BI.")) == []
+
+
+def test_tc25c_mixed_sentence_scores_only_the_clause_that_is_required():
+    """End to end: 'SQL is required, Python optional, Kubernetes not required' in one sentence."""
+    jd = "Data role. SQL is required, Python optional, Kubernetes is not required."
+    resume = "Test Candidate\nEXPERIENCE\n- Wrote SQL queries for monthly sales reports.\n"
+    data = payload(
+        candidate_skills=["SQL"], required_skills=["SQL", "Python", "Kubernetes"],
+        matched_skills=[{"skill": "SQL", "evidence": "Wrote SQL queries for monthly sales reports."}],
+        missing_skills=["Python", "Kubernetes"],
+    )
+    result, _ = validate(data, resume=resume, jd=jd)
+    assert result["required_skills"] == ["SQL"]
+    assert result["score_breakdown"]["skills_coverage"] == 40   # 1 of 1 mandatory requirement
+    assert [p["skill"] for p in result["preferred_skills"]] == ["Python"]
+    assert "Kubernetes" not in result["missing_skills"]
+
+
+# =====================================================================================
+# Rate limits (free Groq plans allow only a few thousand tokens per minute) and offline use
+# =====================================================================================
+class RateLimitError(Exception):
+    """Same class name as the Groq SDK's, which is how core.py recognises it."""
+
+
+def _rate_msg(wait):
+    return ("Error code: 429 - {'error': {'message': 'Rate limit reached for model `openai/gpt-oss-120b` "
+            f"on tokens per minute (TPM): Limit 8000, Used 5843, Requested 2692. Please try again in {wait}. "
+            "Need more tokens?', 'code': 'rate_limit_exceeded'}}")
+
+
+def _client_with(create):
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def _ok_response(text="OK"):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+
+
+@pytest.mark.parametrize("hint,seconds", [
+    ("4.0125s", 4.0125), ("52.5ms", 0.0525), ("194.999999ms", 0.195), ("11.25s", 11.25),
+    ("1m2.5s", 62.5), ("6.314999999s", 6.315),
+])
+def test_tc26_retry_hint_is_read_from_the_groq_message(hint, seconds):
+    assert core._retry_after_seconds(RateLimitError(_rate_msg(hint))) == pytest.approx(seconds)
+    assert core._retry_after_seconds(Exception("something else")) is None
+
+
+def test_tc26b_rate_limit_is_waited_out_then_succeeds(monkeypatch):
+    calls, sleeps = [], []
+
+    def create(**kwargs):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise RateLimitError(_rate_msg("4.0s"))
+        return _ok_response("fine")
+
+    monkeypatch.setattr(core, "get_client", lambda: _client_with(create))
+    monkeypatch.setattr(core.time, "sleep", sleeps.append)
+    assert core.call_groq([{"role": "user", "content": "hi"}], attempts=1) == "fine"
+    assert sleeps == [5.0, 5.0]  # Groq's 4 s + 1 s margin, twice
+    # attempts=1 still worked: waiting for a rate limit is not a failed attempt
+
+
+def test_tc26c_rate_limit_that_never_clears_gives_a_clear_message(monkeypatch):
+    sleeps = []
+
+    def create(**kwargs):
+        raise RateLimitError(_rate_msg("11.25s"))
+
+    monkeypatch.setattr(core, "get_client", lambda: _client_with(create))
+    monkeypatch.setattr(core.time, "sleep", sleeps.append)
+    with pytest.raises(RuntimeError, match="rate limit reached") as info:
+        core.call_groq([{"role": "user", "content": "hi"}])
+    assert len(sleeps) == core.RATE_LIMIT_RETRIES
+    assert "12 seconds" in str(info.value)      # tells the user how long to wait
+    assert "Requested 2692" not in str(info.value)  # raw Groq details stay in the log
+
+
+def test_tc26d_a_very_long_wait_is_reported_not_waited_for(monkeypatch):
+    sleeps = []
+
+    def create(**kwargs):
+        raise RateLimitError(_rate_msg("25m10s"))  # e.g. a daily limit
+
+    monkeypatch.setattr(core, "get_client", lambda: _client_with(create))
+    monkeypatch.setattr(core.time, "sleep", sleeps.append)
+    with pytest.raises(RuntimeError, match="rate limit reached"):
+        core.call_groq([{"role": "user", "content": "hi"}])
+    assert sleeps == []
+
+
+def test_tc26e_streaming_chat_also_waits_out_a_rate_limit(monkeypatch):
+    calls, sleeps = [], []
+
+    def chunk(text):
+        return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=text))])
+
+    def create(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RateLimitError(_rate_msg("2.0s"))
+        return iter([chunk("Hello "), chunk("there")])
+
+    monkeypatch.setattr(core, "get_client", lambda: _client_with(create))
+    monkeypatch.setattr(core.time, "sleep", sleeps.append)
+    assert list(core.call_groq_stream([{"role": "user", "content": "hi"}]))[-1] == "Hello there"
+    assert sleeps == [3.0]
+
+
+def test_tc26f_no_internet_gives_an_actionable_message():
+    class APIConnectionError(Exception):
+        pass
+    message = core._friendly_error(APIConnectionError("Connection error."))
+    assert "Cannot reach Groq" in message and "internet" in message
